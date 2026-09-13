@@ -180,14 +180,15 @@ STATE_LABEL = {"published":"published","active":"active","result_ready":"result 
                "finished":"finished","rejected":"rejected",
                "cancelled":"cancelled","timeout":"timeout",
                "target_absent":"target absent","source_absent":"source absent"}
-STATE_STYLE = {"published":("cyan",),"active":("cyan",),"result_ready":("boldblue",),
-               "finished":("boldgreen",),"rejected":("boldred",),
-               "cancelled":("dim",),"timeout":("boldred",),
-               "target_absent":("boldred",),"source_absent":("boldred",)}
+STATE_STYLE = {"published":("blue",),"active":("cyan",),"result_ready":("magenta",),
+               "finished":("green",),"rejected":("red",),
+               "cancelled":("dim",),"timeout":("red",),
+               "target_absent":("red",),"source_absent":("red",)}
 ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",
                 "reply":"reply","source_reply":"reply","none":"—"}
-_CODES = {"dim":"2","bold":"1","red":"31","green":"32","yellow":"33","blue":"34","cyan":"36",
-          "boldred":"1;31","boldgreen":"1;32","boldyellow":"1;33","boldblue":"1;34","boldcyan":"1;36"}
+# No bold anywhere: weight is carried by colour alone. The bold codes are deliberately
+# absent from this table so a stray `("boldred",)` fails to render instead of creeping back.
+_CODES = {"dim":"2","red":"31","green":"32","yellow":"33","blue":"34","magenta":"35","cyan":"36"}
 _ANSI_ON = False
 
 def _use_color():
@@ -212,6 +213,19 @@ def _fit(s, width):
         out += ch; w += _cw(ch)
     return out + "…"
 
+def _fit_segments(segs, width):
+    """Trim a [(text, styles)] list to `width` display columns. Returns (segments, used)."""
+    out, used = [], 0
+    for text, styles in segs:
+        if used + _dw(text) > width:
+            room = width - used
+            if room > 1:
+                piece = _fit(text, room)
+                out.append((piece, styles)); used += _dw(piece)
+            break
+        out.append((text, styles)); used += _dw(text)
+    return out, used
+
 def _pad(s, width, right=False):
     gap = max(0, width - _dw(s))
     return " "*gap + s if right else s + " "*gap
@@ -230,7 +244,7 @@ def _human_age(sec):
     return "%dd%02dh" % (sec // 86400, sec % 86400 // 3600)
 
 STATUS_STYLE = {"idle":("green",), "done":("green",), "working":("yellow",),
-                "blocked":("boldred",), "unknown":("dim",)}
+                "blocked":("red",), "unknown":("dim",)}
 # Herdr reports `idle` and `done` alike as "ready for input"; both count as safe to prompt.
 READY_STATUSES = ("idle","done")
 STATUS_TTL = 1.0
@@ -290,9 +304,19 @@ def board_items():
     return items
 
 MARK_W = 4          # cursor glyph + "[x]" checkbox
-LEGEND = "j/k move · space pick · a all · n resend · d delete · s daemon · q quit"
+LEGEND = [("↑↓", "move"), ("space", "select"), ("a", "all"), ("r", "resend"),
+          ("d", "delete"), ("t", "daemon"), ("q", "quit")]
 
-def render_board(width=100, selected=None, cursor=None, statuses=None, items=None, footer=None):
+def _legend_segments():
+    """Keys rendered bright so they stand out from their dim descriptions."""
+    segs = []
+    for idx, (key, label) in enumerate(LEGEND):
+        if idx: segs.append(("  ·  ", ("dim",)))
+        segs.append((key, ("cyan",)))
+        segs.append((" " + label, ("dim",)))
+    return segs
+
+def render_board(width=100, selected=None, cursor=None, statuses=None, items=None, message=None):
     selected = selected or frozenset()
     if statuses is None: statuses = agent_statuses()
     if items is None: items = board_items()
@@ -303,18 +327,11 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
         label = ACTION_LABEL.get(i["action"], i["action"])
-        if i["mine"]: return "▶ %s" % label, ("boldyellow",)
+        if i["mine"]: return "▶ %s" % label, ("yellow",)
         return "%s · %s" % (label, i["actor"]), ("dim",)
 
     def name_of(i, which): return i["src_agent"] if which == "src" else i["dst_agent"]
     def stat_of(i, which): return i["src_status"] if which == "src" else i["dst_status"]
-    def full_of(i, which): return "%s %s" % (name_of(i,which), stat_of(i,which) or "absent")
-
-    def seg(i, which, dim):
-        base = ("dim",) if dim else ()
-        st = stat_of(i, which)
-        if st is None: return [(name_of(i,which), base), (" absent", ("dim",) if dim else ("boldred",))]
-        return [(name_of(i,which), base), (" %s" % st, ("dim",) if dim else STATUS_STYLE.get(st, ("dim",)))]
 
     def widest(header, values):
         return max([_dw(header)] + [_dw(v) for v in values])
@@ -322,15 +339,32 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     kid = widest("ID", [i["id"] for i in items])
     kst = widest("STATE", [STATE_LABEL.get(i["state"], i["state"]) for i in items])
     kag = widest("AGE", [i["age"] for i in items])
-    knx = widest("NEXT", [next_cell(i)[0] for i in items])
+    knx = widest("ACTION", [next_cell(i)[0] for i in items])
     krt = widest("ROUTE", [i["route"] for i in items])
-    ksf = widest("SRC", [full_of(i,"src") for i in items])
-    kdf = widest("DST", [full_of(i,"dst") for i in items])
     ksn = widest("SRC", [name_of(i,"src") for i in items])
     kdn = widest("DST", [name_of(i,"dst") for i in items])
 
+    def status_cell(i, which, dim):
+        """(plain, segments) for one SRC/DST cell.
+
+        Names are padded to the column's widest so the status words line up down the board,
+        and the name is left unstyled while only the status carries colour -- the eye
+        should land on the state, not on the agent name. The status keeps that colour on a
+        dimmed row too: the STATE column does, and greying one but not the other left a
+        finished row with a coloured state and apparently uncoloured agent statuses.
+        """
+        name, st = name_of(i, which), stat_of(i, which)
+        name_w = ksn if which == "src" else kdn
+        word = "absent" if st is None else st
+        style = ("red",) if st is None else STATUS_STYLE.get(st, ("dim",))
+        name_text = _pad(name, name_w) + " "
+        return name_text + word, [(name_text, ("dim",) if dim else ()), (word, style)]
+
+    ksf = widest("SRC", [status_cell(i,"src",False)[0] for i in items])
+    kdf = widest("DST", [status_cell(i,"dst",False)[0] for i in items])
+
     # Narrowing ladder: full status columns, then names only, then one ROUTE column, then drop NEXT.
-    routing, show_next = "full", True
+    routing, show_action = "full", True
     MIN_DESC = 12
     def routing_w():
         if routing == "full":  return ksf + 2 + kdf + 2
@@ -339,12 +373,12 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         return 0
     def fixed():
         w = MARK_W + kid + kst + kag + 2*4 + routing_w()
-        if show_next: w += knx + 2
+        if show_action: w += knx + 2
         return w
     while width - fixed() < MIN_DESC:
         if routing == "full": routing = "names"
         elif routing == "names": routing = "route"
-        elif show_next: show_next = False
+        elif show_action: show_action = False
         elif routing == "route": routing = "none"
         else: break
     desc_w = max(4, width - fixed())
@@ -370,7 +404,8 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
             if routing == "names": return [("SRC",("dim",),ksn,"l"), ("DST",("dim",),kdn,"l")]
             if routing == "route": return [("ROUTE",("dim",),krt,"l")]
             return []
-        if routing == "full":  return [(seg(i,"src",dim),(),ksf,"l"), (seg(i,"dst",dim),(),kdf,"l")]
+        if routing == "full":  return [(status_cell(i,"src",dim)[1],(),ksf,"l"),
+                                       (status_cell(i,"dst",dim)[1],(),kdf,"l")]
         if routing == "names": return [(name_of(i,"src"),dim,ksn,"l"), (name_of(i,"dst"),dim,kdn,"l")]
         if routing == "route": return [(i["route"], dim, krt, "l")]
         return []
@@ -379,7 +414,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         cells = [(mark, ms, MARK_W, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
         cells += routing_cells(i, ds, header)
         cells.append((state, ss, kst, "l"))
-        if show_next: cells.append((nxt, ns, knx, "l"))
+        if show_action: cells.append((nxt, ns, knx, "l"))
         cells.append((age, as_, kag, "r"))
         return row(cells)
 
@@ -387,24 +422,16 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     awaiting = sum(1 for i in items if i["mine"] and not i["closed"])
     daemon_on = daemon_running()
     # Header is built from segments so it can be truncated instead of overrunning a narrow pane.
-    segs = [("Handoff", ("bold",)), (" · %d task%s" % (n, "" if n == 1 else "s"), ("dim",))]
-    if awaiting: segs.append((" · %d awaiting you" % awaiting, ("boldyellow",)))
+    segs = [("Handoff", ()), (" · %d task%s" % (n, "" if n == 1 else "s"), ("dim",))]
+    if awaiting: segs.append((" · %d awaiting you" % awaiting, ("yellow",)))
     segs += [(" · daemon ", ("dim",)),
              ("on" if daemon_on else "off", ("green",) if daemon_on else ("dim",))]
     clock = datetime.now().strftime("%H:%M:%S")
-    budget = max(0, width - len(clock) - 1)
-    head, used = [], 0
-    for txt, stl in segs:
-        if used + _dw(txt) > budget:
-            if budget - used > 1:
-                piece = _fit(txt, budget - used)
-                head.append((piece, stl)); used += _dw(piece)
-            break
-        head.append((txt, stl)); used += _dw(txt)
+    head, used = _fit_segments(segs, max(0, width - len(clock) - 1))
     lines = ["".join(_paint(t, *s) for t, s in head)
              + " " * max(1, width - used - len(clock)) + _paint(clock, "dim"),
              _paint("─" * max(1, width), "dim")]
-    lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "NEXT", "AGE",
+    lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "ACTION", "AGE",
                           ("dim",), ("dim",), ("dim",), ("dim",), ("dim",), header=True))
     if not items:
         lines.append(_paint("  no tasks yet — handoff send ... to create one", ("dim",)))
@@ -413,29 +440,36 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         nxt, ns = next_cell(i)
         glyph = "❯" if idx == cursor else ("▸" if i["mine"] else " ")
         box = "[x]" if i["id"] in selected else "[ ]"
-        ms = ("boldcyan",) if idx == cursor else (("boldyellow",) if i["mine"] else ds)
+        ms = ("cyan",) if idx == cursor else (("yellow",) if i["mine"] else ds)
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
                               STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
                               ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i))
+    # The last two lines are fixed furniture: the message line, then the key legend.
+    # The message line is reserved even when empty so the board never shifts under a keypress.
     lines.append("")
-    if footer is None:
-        ftext, fstyles = LEGEND, ("dim",)
-    else:
-        ftext, fstyles = footer
-    lines.append(_paint(_fit(ftext, width), *fstyles))     # fit before painting, never after
+    lines.append(_paint(_fit(message[0], width), *message[1]) if message else "")
+    lines.append("".join(_paint(t, *s) for t, s in _fit_segments(_legend_segments(), width)[0]))
     return "\n".join(lines)
 
 # ---------- interactive board ----------
 
 def _read_key(timeout):
-    """Return a key name ("UP"/"DOWN"/"ESC"), a literal character, or None on timeout."""
-    if not select.select([sys.stdin], [], [], timeout)[0]: return None
-    ch = sys.stdin.read(1)
+    """Return a key name ("UP"/"DOWN"/"ESC"), a literal character, or None on timeout.
+
+    Reads the raw fd, never sys.stdin. The buffered reader would swallow a whole escape
+    sequence into Python's buffer, leaving the fd empty so the next select() reports no
+    data: every arrow key would degrade to a bare Escape and the leftover bytes would
+    desynchronise the keys that follow.
+    """
+    fd = sys.stdin.fileno()
+    def ready(t): return bool(select.select([fd], [], [], t)[0])
+    if not ready(timeout): return None
+    ch = os.read(fd, 1).decode("utf-8", "replace")
     if ch != "\033": return ch
-    if not select.select([sys.stdin], [], [], 0.03)[0]: return "ESC"      # bare Escape
-    if sys.stdin.read(1) != "[": return "ESC"
-    if not select.select([sys.stdin], [], [], 0.03)[0]: return "ESC"
-    return {"A":"UP","B":"DOWN","C":"RIGHT","D":"LEFT"}.get(sys.stdin.read(1))
+    if not ready(0.03): return "ESC"                                       # bare Escape
+    if os.read(fd, 1) != b"[": return "ESC"
+    if not ready(0.03): return "ESC"
+    return {b"A":"UP", b"B":"DOWN", b"C":"RIGHT", b"D":"LEFT"}.get(os.read(fd, 1))
 
 def toggle_daemon():
     """The daemon is a foreground process, so start it detached; stop just drops the stop file."""
@@ -485,12 +519,12 @@ def ui(_):
             cursor = max(0, min(cursor, len(items)-1)) if items else 0
             if flash and time.time() > flash[1]: flash = None
             if mode == "confirm_delete":
-                footer = ("Delete %d task(s)? %s   [y/N]" % (len(pending), ", ".join(pending)),
-                          ("boldred",))
-            elif flash: footer = (flash[0], ("boldyellow",))
-            else: footer = None
+                message = ("Delete %d task(s)? %s   [y/N]" % (len(pending), ", ".join(pending)),
+                           ("red",))
+            elif flash: message = (flash[0], ("yellow",))
+            else: message = None
             sys.stdout.write("\033[H" + render_board(width, selected, cursor,
-                                                     statuses, items, footer) + "\033[J")
+                                                     statuses, items, message) + "\033[J")
             sys.stdout.flush()
 
             key = _read_key(1.0)
@@ -518,7 +552,7 @@ def ui(_):
             elif key == "a":
                 ids = {i["id"] for i in items}
                 selected = set() if ids and selected >= ids else set(ids)
-            elif key == "n":
+            elif key == "r":
                 if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
                 else:
                     sent, skipped, failed = resend_tasks(sorted(selected), statuses)
@@ -530,7 +564,7 @@ def ui(_):
             elif key == "d":
                 if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
                 else: pending, mode = sorted(selected), "confirm_delete"
-            elif key == "s":
+            elif key == "t":
                 flash = (toggle_daemon(), time.time()+3)
     except KeyboardInterrupt:
         pass

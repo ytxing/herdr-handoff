@@ -45,6 +45,27 @@ A 领取并验收：
 
 后台不会解析终端自然语言。B 必须显式执行 `take` 和 `done`；A 必须显式执行 `claim` 和 `accept`。有 handoff task 时，B 不要直接使用 `herdr agent prompt` 回报 A，统一通过 `handoff done`，由服务通知 A。
 
+## 看板操作
+
+`handoff ui` 不只是展示，可以直接操作任务：
+
+| 按键 | 作用 |
+|---|---|
+| `↓` / `↑`、`j` / `k` | 移动光标 |
+| `空格` | 勾选/取消光标所在行 |
+| `a` | 全选 / 全不选 |
+| `r` | 向勾选任务的 Target 重发已存 prompt |
+| `d` | 删除勾选任务（先弹确认） |
+| `y` / `Enter` | 确认删除；其他任意键取消 |
+| `t` | 启动 / 停止 daemon |
+| `q` / `Ctrl-C` | 退出 |
+
+`r` 只对 Herdr 状态为 `idle` 或 `done` 的 Target 生效，其余跳过并在提示条**上方单独一行**列出被跳过的原因（`working`、`absent` 等）——提示不会盖住快捷键条。Herdr 本身不会拒绝向忙碌的 agent 投递 prompt，所以这道判断由看板负责，没有它就会打断正在进行的任务。
+
+SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 覆盖全部 agent），不依赖 daemon 是否在运行。终端过窄时这两列会按阶梯收缩，到 43 列左右会先放弃路由再放弃 ACTION，再窄就只能换 `handoff list` 了。这个下限来自 DESCRIPTION 的 4 列保底宽度，会随状态标签与 AGE 的显示宽度浮动。
+
+`ACTION` 列是「下一步该谁敲哪条命令」：`take · h2` 表示等 h2 执行 `take`，`▶ accept` 表示轮到你执行 `accept`（`▶` 是拿你所在 pane 与任务的 source/target pane 比对得出的），`—` 表示任务已终结。这是读看板时最该先看的一列——handoff 的状态机只在有人执行显式命令时才前进。
+
 ## 配置
 
 当前默认值写在 Spec 中：协议提醒 30 秒一次；执行和验收退避从 2 分钟开始，最大 8 小时。第一版运行参数仍使用环境变量 `HANDOFF_STATE_DIR` 选择本地状态目录。
@@ -55,7 +76,7 @@ A 领取并验收：
 herdr plugin link "$PWD"
 ```
 
-插件提供 Handoff Board pane，但不会自动启动 daemon。需要手动执行 `./handoff daemon start`。
+插件提供 Handoff Board pane，但不会自动启动 daemon——可以手动执行 `./handoff daemon start`，也可以在看板里按 `t` 开关。
 
 ## 测试
 

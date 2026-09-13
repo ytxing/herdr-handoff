@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -112,11 +113,60 @@ class BoardRenderTests(HandoffTestBase):
         self.assertIn("[x]", cursors[0], "the cursor row is the one that was selected")
         self.assertIn("[ ]", [l for l in lines if "t_aaaa111122" in l][0])
 
-    def test_status_columns_show_each_agent_and_its_state(self):
+    def test_status_columns_show_a_name_and_state(self):
         frame = self.board(150)
-        self.assertIn("h1 working", frame)
-        self.assertIn("h2 idle", frame)
-        self.assertIn("gone absent", frame, "an agent herdr does not know reads as absent")
+        self.assertRegex(frame, r"h1\s+working")
+        self.assertRegex(frame, r"h2\s+idle")
+        self.assertRegex(frame, r"t1-main\s+absent")
+        self.assertRegex(frame, r"gone\s+absent", "an agent herdr does not know reads as absent")
+        self.assertNotIn("●", frame, "status dots were dropped in favour of plain words")
+        self.assertNotIn("○", frame)
+
+    def test_status_words_line_up_down_a_column(self):
+        """Names are padded to the column's widest, so the states read as a straight line.
+
+        Measured in display columns, not string indices: the descriptions include CJK,
+        so a character offset would differ between rows even when the rendering lines up.
+        """
+        dw = self.handoff._dw
+        offsets = [dw(line[:m.start()]) for line in self.board(150).split("\n")
+                   for m in [re.search(r"\b(?:idle|done|working|blocked|unknown|absent)\b", line)] if m]
+        self.assertGreater(len(offsets), 1, "expected several rows carrying a status word")
+        self.assertEqual(len(set(offsets)), 1,
+                         "SRC state words start at differing display columns: %r" % sorted(set(offsets)))
+
+    def test_status_keeps_its_colour_on_a_finished_row(self):
+        """Dimming a closed row must not strip the colour off its status words."""
+        self.handoff._ANSI_ON = True
+        try:
+            row = [l for l in self.board(150).split("\n") if "t_cccc555566" in l][0]
+        finally:
+            self.handoff._ANSI_ON = False
+        self.assertIn("\033[32midle", row, "idle stays green even on a finished row")
+        self.assertIn("\033[32mfinished", row, "the STATE column already behaved this way")
+
+    def test_nothing_on_the_board_is_bold(self):
+        """Weight was dropped from the whole board: colour alone carries the meaning.
+
+        Asserts on the rendered escape codes rather than the style tables, so a bold code
+        reintroduced anywhere in the render path gets caught.
+        """
+        self.handoff._ANSI_ON = True
+        try:
+            frame = self.board(150, selected={"t_bbbb333344"}, cursor=1,
+                               message=("Deleted 1 task(s)", ("red",)))
+        finally:
+            self.handoff._ANSI_ON = False
+        codes = set(re.findall(r"\x1b\[([0-9;]+)m", frame))
+        self.assertEqual(sorted(c for c in codes if c == "1" or c.startswith("1;")), [],
+                         "bold was removed from the board on request")
+
+    def test_last_two_lines_are_reserved(self):
+        """The message line and the legend are always the final two lines, empty or not."""
+        for msg in (None, ("Resent to h2", ("boldyellow",))):
+            lines = self.board(120, message=msg).split("\n")
+            self.assertIn("q quit", lines[-1], "the legend is always the last line")
+            self.assertEqual(lines[-2], "" if msg is None else "Resent to h2")
 
     def test_columns_shrink_in_ladder_order(self):
         header = lambda w: self.board(w).split("\n")[2]
