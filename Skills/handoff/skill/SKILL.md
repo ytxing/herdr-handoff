@@ -49,6 +49,7 @@ duplicate or untracked delivery.
 If work began before `take`, use `--implicit-take` with `done`. Use `progress` only to
 reset the long execution timer. Use `reject` only when explicitly refusing the task;
 do not use it merely because a reminder arrived. Use `blocked` when Source must answer.
+When Source answers a blocked task, run `reply <task-id> --message "<answer>"`.
 
 ## Source review
 

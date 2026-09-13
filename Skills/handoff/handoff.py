@@ -7,6 +7,12 @@ from pathlib import Path
 ROOT = Path(os.environ.get("HANDOFF_STATE_DIR", Path.home()/".local/state/handoff"))
 DB = ROOT / "handoff.sqlite3"
 CLI = str(Path(__file__).resolve())
+PROTOCOL_ACK_TIMEOUT = int(os.environ.get("HANDOFF_PROTOCOL_ACK_TIMEOUT", "30"))
+PROTOCOL_ACK_RETRIES = int(os.environ.get("HANDOFF_PROTOCOL_ACK_RETRIES", "3"))
+EXECUTION_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_INITIAL", "120"))
+EXECUTION_BACKOFF_MAX = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_MAX", "28800"))
+REVIEW_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_INITIAL", "120"))
+REVIEW_BACKOFF_MAX = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_MAX", "28800"))
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def conn():
@@ -24,9 +30,9 @@ def conn():
 def transition(c, tid, state, action, last_action=None, error=None):
     c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=? where id=?",
               (state,action,now(),last_action or action,now(),error,tid)); c.commit()
-def herdr(*args):
+def herdr(*args, timeout=20):
     try:
-        p=subprocess.run([os.environ.get("HERDR_BIN_PATH","herdr"),*args],text=True,capture_output=True,timeout=20)
+        p=subprocess.run([os.environ.get("HERDR_BIN_PATH","herdr"),*args],text=True,capture_output=True,timeout=timeout)
         if p.returncode: return None
         return json.loads(p.stdout)
     except Exception: return None
@@ -41,7 +47,7 @@ def cmd_send(a):
     if agent_get(a.source_agent) is None: raise SystemExit("source agent is absent or herdr is unavailable")
     if agent_get(a.target_agent) is None: raise SystemExit("target agent is absent or herdr is unavailable")
     c.execute("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      (tid,a.description,a.prompt,a.source_agent,a.source_pane,a.target_agent,a.target_pane,"published","take",now(),now(),"present","present")); c.commit()
+      (tid,a.description,a.prompt,a.source_agent,a.source_pane,a.target_agent,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
     text=f"[HANDOFF TASK]\nTask ID: {tid}\nDescription: {a.description}\nSource: {a.source_agent} / {a.source_pane}\nTarget: {a.target_agent} / {a.target_pane}\n\nBefore any work, run:\npython3 {CLI} take {tid}\n\nTask:\n{a.prompt}\n\nOn completion run:\npython3 {CLI} done {tid} --result-file <path>\nIf still working run:\npython3 {CLI} progress {tid}\nOnly if refusing run:\npython3 {CLI} reject {tid} --reason \"<reason>\""
     if prompt(a.target_agent,text) is None: transition(c,tid,"timeout","take",error="prompt failed")
     print(tid)
@@ -60,7 +66,8 @@ def cmd_action(a):
     elif a.cmd=="claim": transition(c,a.id,"reviewing","accept","claim")
     elif a.cmd=="accept": transition(c,a.id,"finished","none","accept")
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
-    elif a.cmd=="blocked": transition(c,a.id,"active","source_reply","blocked",a.reason)
+    elif a.cmd=="blocked": transition(c,a.id,"active","reply","blocked",a.reason)
+    elif a.cmd=="reply": transition(c,a.id,"active","done","reply",a.message)
     elif a.cmd=="request-changes": transition(c,a.id,"active","done","request-changes",a.reason)
     elif a.cmd=="stop": transition(c,a.id,"stopped","none","stop")
     elif a.cmd=="resume": transition(c,a.id,"active",row["action"],"resume")
@@ -91,7 +98,10 @@ def daemon(a):
         try: (ROOT/"daemon.stop").touch()
         except: pass
         return
-    ROOT.mkdir(parents=True,exist_ok=True); (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
+    ROOT.mkdir(parents=True,exist_ok=True)
+    try: (ROOT/"daemon.stop").unlink()
+    except FileNotFoundError: pass
+    (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
     try:
         while not (ROOT/"daemon.stop").exists():
             c=conn()
@@ -99,15 +109,31 @@ def daemon(a):
                 ag=r["target_agent"] if r["action"] in ("take","done") else r["source_agent"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
-                    lifecycle=info.get("result",info).get("status",info.get("status","unknown")) if isinstance(info,dict) else "unknown"
+                    result = info.get("result", info) if isinstance(info,dict) else {}
+                    agent_info = result.get("agent", result) if isinstance(result,dict) else {}
+                    lifecycle = agent_info.get("agent_status", agent_info.get("status", "unknown")) if isinstance(agent_info,dict) else "unknown"
                 c.execute(f"update tasks set {'target' if ag==r['target_agent'] else 'source'}_lifecycle=?, {'target' if ag==r['target_agent'] else 'source'}_presence=? where id=?",(lifecycle,present,r['id'])); c.commit()
                 if present=="absent": transition(c,r["id"],"target_absent" if ag==r["target_agent"] else "source_absent","none",error="Herdr Agent absent"); continue
                 if lifecycle=="working":
                     # Herdr owns the wait; this time is outside task backoff.
-                    herdr("agent","wait",ag,"--until","idle")
+                    waited = herdr("agent","wait",ag,"--until","idle", timeout=None)
+                    if waited is None:
+                        c.execute("update tasks set error=? where id=?", ("Herdr agent wait failed", r['id'])); c.commit()
+                        continue
                 if time.time() >= datetime.fromisoformat((r["next_prompt_at"] or now())).timestamp():
+                    retries = r["retry_count"]
+                    protocol = r["state"] in ("published", "result_ready")
+                    if protocol and retries >= PROTOCOL_ACK_RETRIES:
+                        transition(c, r["id"], "timeout", "none", error="protocol acknowledgement timeout")
+                        continue
                     prompt(ag,f"[HANDOFF REMINDER]\nTask ID: {r['id']}\nDescription: {r['description']}\nRequired command: python3 {CLI} {r['action']} {r['id']}")
-                    c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+30,timezone.utc).isoformat(),r['id'])); c.commit()
+                    if protocol:
+                        delay = PROTOCOL_ACK_TIMEOUT
+                    elif r["state"] == "reviewing":
+                        delay = min(REVIEW_BACKOFF_MAX, REVIEW_BACKOFF_INITIAL * (2 ** retries))
+                    else:
+                        delay = min(EXECUTION_BACKOFF_MAX, EXECUTION_BACKOFF_INITIAL * (2 ** retries))
+                    c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+delay,timezone.utc).isoformat(),r['id'])); c.commit()
             time.sleep(5)
     finally:
         for p in (ROOT/"daemon.pid",ROOT/"daemon.stop"):
@@ -126,7 +152,7 @@ STATE_STYLE = {"published":("cyan",),"active":("cyan",),"result_ready":("boldblu
                "cancelled":("dim",),"stopped":("dim",),"timeout":("boldred",),
                "target_absent":("boldred",),"source_absent":("boldred",)}
 ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",
-                "source_reply":"reply","none":"—"}
+                "reply":"reply","source_reply":"reply","none":"—"}
 _CODES = {"dim":"2","bold":"1","red":"31","green":"32","yellow":"33","blue":"34","cyan":"36",
           "boldred":"1;31","boldgreen":"1;32","boldyellow":"1;33","boldblue":"1;34"}
 _ANSI_ON = False
@@ -275,8 +301,9 @@ def ui(_):
 def main():
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
     s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
-    for n in ("take","progress","claim","accept","reject","blocked","request-changes","stop","resume","cancel","done-implicit"):
+    for n in ("take","progress","claim","accept","reject","blocked","reply","request-changes","stop","resume","cancel","done-implicit"):
         x=sp.add_parser(n); x.add_argument("id"); x.add_argument("--reason", "--description", dest="reason", default=""); x.add_argument("--result-file"); x.set_defaults(fn=cmd_action,cmd=n)
+    sp_reply = sp.choices["reply"]; sp_reply.add_argument("--message", required=True)
     x=sp.add_parser("delete"); x.add_argument("id", nargs="?"); x.add_argument("--state"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_action,cmd="delete")
     d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.set_defaults(fn=cmd_action,cmd="done")
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)

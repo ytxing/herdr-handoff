@@ -51,7 +51,7 @@ target_absent
 `required_action` 为：
 
 ```text
-take | done | claim | accept | source_reply | none
+take | done | claim | accept | reply | none
 ```
 
 Herdr 观测状态单独保存：
@@ -81,7 +81,7 @@ handoff cancel <task-id>
 handoff delete <task-id>
 ```
 
-`progress` 不改变业务状态，只刷新执行计时。`reject` 只能由 Agent 明确执行，后台不能自行推断拒绝。`blocked` 保持任务为 `active`，并将 `required_action` 设为 `source_reply`；后台 Prompt Source 回复 B。
+`progress` 不改变业务状态，只刷新执行计时。`reject` 只能由 Agent 明确执行，后台不能自行推断拒绝。`blocked` 保持任务为 `active`，并将 `required_action` 设为 `reply`；后台 Prompt Source 回复 B。
 `delete` 永久删除任务记录及其已保存的结果文件。
 `delete --state <state>` 删除指定状态的任务；`delete --all` 删除全部任务。
 
@@ -239,7 +239,7 @@ B 忘记 `take` 时：
 
 A 忘记 `claim` 或 `accept` 时，使用 `protocol_ack_timeout` 提醒；结果持续保存在本地。
 
-B 执行 `blocked` 后，任务保持 `active`，`required_action = source_reply`。Source 回复后由人工或后续命令继续处理；后台不解析回复内容。
+B 执行 `blocked` 后，任务保持 `active`，`required_action = reply`。Source 使用 `handoff reply <task-id> --message ...` 回复；后台不解析回复内容。
 
 ## Herdr 适配
 
