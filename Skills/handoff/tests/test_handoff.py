@@ -93,7 +93,9 @@ class BoardRenderTests(HandoffTestBase):
             c.execute(INSERT, row + (self.handoff.now(),))
         c.commit()
         # Explicit statuses keep herdr out of the test; `gone` is deliberately unknown to it.
-        self.statuses = {"h1": "working", "h2": "idle", "wA:p2V": "working", "wA:p2W": "idle"}
+        # Each value is (agent_status, current name) as agent_statuses() returns them.
+        self.statuses = {"h1": ("working", "h1"), "h2": ("idle", "h2"),
+                         "wA:p2V": ("working", "h1"), "wA:p2W": ("idle", "h2")}
 
     def board(self, width, **kw):
         return self.handoff.render_board(width, statuses=self.statuses,
@@ -144,6 +146,44 @@ class BoardRenderTests(HandoffTestBase):
             self.handoff._ANSI_ON = False
         self.assertIn("\033[32midle", row, "idle stays green even on a finished row")
         self.assertIn("\033[32mfinished", row, "the STATE column already behaved this way")
+
+    def seed_many(self, count=20):
+        c = self.db()
+        for k in range(count):
+            c.execute(INSERT, ("t_many%06d" % k, "任务%d" % k, "prompt", "h1", "wA:p2V", "h2", "wA:p2W",
+                               "finished", "none", self.handoff.now()))
+        c.commit()
+        return self.handoff.board_items()
+
+    def test_frame_never_exceeds_the_terminal_height(self):
+        """A frame taller than the pane scrolls, which smears the previous frame across it."""
+        items = self.seed_many()
+        for height in range(7, 27):
+            for cursor in (0, 5, len(items) - 1):
+                lines = self.handoff.render_board(120, statuses=self.statuses, items=items,
+                                                  height=height, cursor=cursor).split("\n")
+                self.assertLessEqual(len(lines), height,
+                                     "height=%d cursor=%d produced %d lines" % (height, cursor, len(lines)))
+
+    def test_the_window_follows_the_cursor(self):
+        items = self.seed_many()
+        last = len(items) - 1
+        height = 12
+        lines = self.handoff.render_board(120, statuses=self.statuses, items=items,
+                                          height=height, cursor=last).split("\n")
+        marked = [l for l in lines if l.startswith("❯")]
+        self.assertEqual(len(marked), 1, "the cursor row must stay on screen")
+        self.assertIn(items[last]["id"], marked[0])
+        room = height - self.handoff.BOARD_CHROME
+        self.assertIn("showing %d-%d of %d" % (len(items) - room + 1, len(items), len(items)), lines[0],
+                      "a windowed board says which slice it is showing")
+
+    def test_unwindowed_rendering_is_unchanged(self):
+        """height=None keeps every row, which is what the non-TTY and test paths rely on."""
+        items = self.seed_many()
+        frame = self.handoff.render_board(120, statuses=self.statuses, items=items)
+        self.assertEqual(len(frame.split("\n")), len(items) + self.handoff.BOARD_CHROME)
+        self.assertNotIn("/%d" % len(items), frame.split("\n")[0])
 
     def test_nothing_on_the_board_is_bold(self):
         """Weight was dropped from the whole board: colour alone carries the meaning.
@@ -224,8 +264,21 @@ class BoardRenderTests(HandoffTestBase):
             self.handoff.prompt = original
         self.assertEqual(delivered, ["h2"], "h2 is idle, so it is the only delivery")
         self.assertEqual(failed, [])
-        self.assertTrue(any("h1(working)" in s for s in skipped))
-        self.assertTrue(any("gone(absent)" in s for s in skipped))
+        self.assertTrue(any("h1 skipped — it is working, not idle" == s for s in skipped), skipped)
+        self.assertTrue(any("gone skipped — it is no longer in Herdr" == s for s in skipped), skipped)
+
+    def test_a_renamed_agent_is_shown_by_its_current_name(self):
+        """Agent names are not durable, so the pane's current occupant wins over the stored name.
+
+        This is what produced a task reading "h3-main working": a stale name recorded at send
+        time, paired with a live status looked up by pane id.
+        """
+        lookup, label = self.handoff._lookup_status, self.handoff.live_label
+        statuses = {"h3": ("working", "h3"), "wA:p2Y": ("working", "h3")}
+        entry = lookup(statuses, "h3-main", "wA:p2Y")          # stored name is stale
+        self.assertEqual(label(entry, "h3-main"), "h3", "show who is in the pane now")
+        self.assertIsNone(lookup(statuses, "h3-main", "wA:pZZ"), "an unknown pane resolves to nothing")
+        self.assertEqual(label(None, "h3-main"), "h3-main", "fall back to the recorded name")
 
 
 if __name__ == "__main__":

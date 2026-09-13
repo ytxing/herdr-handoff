@@ -4,4 +4,4 @@
 
 依赖：001、002、004。
 
-验收：期待 Agent 动作前若为 working，先执行 `herdr agent wait --until idle`；等待不计入退避；B 忘记 take/done 或 A 忘记 claim/accept 时发送固定 Prompt；达到重试上限后进入 timeout；daemon 不自动启动。
+验收：期待 Agent 动作前若为 working，先执行 `herdr agent wait --until idle`；等待不计入退避；B 忘记 take/done 或 A 忘记 claim 时发送固定 Prompt；达到重试上限后进入 timeout；daemon 不自动启动。

@@ -104,12 +104,11 @@ def cmd_action(a):
         if not p.is_file() or not os.access(p,os.R_OK): raise SystemExit("result file is not readable")
         dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True); shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done")
-        prompt(row["source_agent"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nRun:\npython3 {CLI} claim {a.id}\nThen inspect it and run:\npython3 {CLI} accept {a.id}\nOr:\npython3 {CLI} request-changes {a.id} --reason \"<要求>\"")
+        prompt(row["source_agent"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --agent-name <your-agent> --tab <your-tab> --pane <your-pane>")
     elif a.cmd in ("claim", "accept"): transition(c,a.id,"finished","none",a.cmd)
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
     elif a.cmd=="blocked": transition(c,a.id,"active","reply","blocked",a.reason)
     elif a.cmd=="reply": transition(c,a.id,"active","done","reply",a.message)
-    elif a.cmd=="request-changes": raise SystemExit("request-changes was removed; send a new task")
     elif a.cmd=="cancel": transition(c,a.id,"cancelled","none","cancel")
     elif a.cmd=="delete":
         if a.id: ids = [r["id"] for r in c.execute("select id from tasks where id=?", (a.id,))]
@@ -140,7 +139,7 @@ def daemon(a):
     try:
         while not (ROOT/"daemon.stop").exists():
             c=conn()
-            for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','stopped','timeout')").fetchall():
+            for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
                 ag=r["target_agent"] if r["action"] in ("take","done") else r["source_agent"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
@@ -251,7 +250,13 @@ STATUS_TTL = 1.0
 _STATUS_CACHE = {"at":0.0, "map":{}}
 
 def agent_statuses(max_age=STATUS_TTL):
-    """Map agent name AND pane id -> agent_status. One herdr call covers every agent."""
+    """Map agent name AND pane id -> (agent_status, current name). One herdr call covers all.
+
+    The name is carried alongside the status because agent names are not durable: a task
+    records the name it was sent to, but the pane may host a renamed agent by the time you
+    look at the board. Showing the stored name next to a live status otherwise renders a
+    name that no longer exists.
+    """
     if time.time() - _STATUS_CACHE["at"] < max_age: return _STATUS_CACHE["map"]
     data = herdr("agent","list", timeout=5)
     if not data: return _STATUS_CACHE["map"]     # keep the last known map; retry next tick
@@ -259,14 +264,27 @@ def agent_statuses(max_age=STATUS_TTL):
     for ag in ((data.get("result") or {}).get("agents") or []):
         st = ag.get("agent_status")
         if not st: continue
-        if ag.get("name"): m[ag["name"]] = st
-        if ag.get("pane_id"): m[ag["pane_id"]] = st
+        entry = (st, ag.get("name"))
+        if ag.get("name"): m[ag["name"]] = entry
+        if ag.get("pane_id"): m[ag["pane_id"]] = entry
     _STATUS_CACHE.update(at=time.time(), map=m)
     return m
 
 def _lookup_status(statuses, name, pane):
-    st = statuses.get(name) if name else None
-    return st if st is not None else (statuses.get(pane) if pane else None)
+    entry = statuses.get(name) if name else None
+    return entry if entry is not None else (statuses.get(pane) if pane else None)
+
+def live_label(entry, stored_name):
+    """The agent name to display: whoever is in the pane now, falling back to the recorded name."""
+    return (entry[1] if entry and entry[1] else None) or stored_name
+
+NOT_READY_REASON = {"working": "it is working, not idle",
+                    "blocked": "it is waiting on an approval dialog",
+                    "unknown": "its state is unknown"}
+
+def not_ready_reason(entry):
+    if entry is None: return "it is no longer in Herdr"
+    return NOT_READY_REASON.get(entry[0], "it is %s" % entry[0])
 
 def daemon_running():
     """True only if the pid file names a live process — a stale file must not read as running."""
@@ -305,7 +323,7 @@ def board_items():
 
 MARK_W = 4          # cursor glyph + "[x]" checkbox
 LEGEND = [("↑↓", "move"), ("space", "select"), ("a", "all"), ("r", "resend"),
-          ("d", "delete"), ("t", "daemon"), ("q", "quit")]
+          ("d", "delete"), ("t", "start/stop daemon"), ("q", "quit")]
 
 def _legend_segments():
     """Keys rendered bright so they stand out from their dim descriptions."""
@@ -316,22 +334,31 @@ def _legend_segments():
         segs.append((" " + label, ("dim",)))
     return segs
 
-def render_board(width=100, selected=None, cursor=None, statuses=None, items=None, message=None):
+BOARD_CHROME = 6      # title, rule, column header, blank, message line, legend
+
+def render_board(width=100, selected=None, cursor=None, statuses=None, items=None,
+                 message=None, height=None):
     selected = selected or frozenset()
     if statuses is None: statuses = agent_statuses()
     if items is None: items = board_items()
     for i in items:
         i["src_status"] = _lookup_status(statuses, i["src_agent"], i["src_pane"])
         i["dst_status"] = _lookup_status(statuses, i["dst_agent"], i["dst_pane"])
+        i["src_label"] = live_label(i["src_status"], i["src_agent"])
+        i["dst_label"] = live_label(i["dst_status"], i["dst_agent"])
+        # ACTION names the actor too, so it needs the same resolution as the SRC/DST columns.
+        i["actor_label"] = i["dst_label"] if i["actor"] == i["dst_agent"] else i["src_label"]
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
         label = ACTION_LABEL.get(i["action"], i["action"])
         if i["mine"]: return "▶ %s" % label, ("yellow",)
-        return "%s · %s" % (label, i["actor"]), ("dim",)
+        return "%s · %s" % (label, i["actor_label"]), ("dim",)
 
-    def name_of(i, which): return i["src_agent"] if which == "src" else i["dst_agent"]
-    def stat_of(i, which): return i["src_status"] if which == "src" else i["dst_status"]
+    def name_of(i, which): return i["src_label"] if which == "src" else i["dst_label"]
+    def stat_of(i, which):
+        entry = i["src_status"] if which == "src" else i["dst_status"]
+        return entry[0] if entry else None
 
     def widest(header, values):
         return max([_dw(header)] + [_dw(v) for v in values])
@@ -419,11 +446,21 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         return row(cells)
 
     n = len(items)
+    # Bound the frame to the terminal height. A frame taller than the pane scrolls on every
+    # redraw, which shifts what \033[H means and leaves the previous frame's tail on screen.
+    start, window = 0, items
+    if height is not None and items:
+        room = max(1, height - BOARD_CHROME)
+        if len(items) > room:
+            start = max(0, min((cursor or 0) - room + 1, len(items) - room))
+            window = items[start:start + room]
     awaiting = sum(1 for i in items if i["mine"] and not i["closed"])
     daemon_on = daemon_running()
     # Header is built from segments so it can be truncated instead of overrunning a narrow pane.
     segs = [("Handoff", ()), (" · %d task%s" % (n, "" if n == 1 else "s"), ("dim",))]
-    if awaiting: segs.append((" · %d awaiting you" % awaiting, ("yellow",)))
+    if len(window) < n:                      # say which slice is on screen, so nothing looks lost
+        segs.append((" · showing %d-%d of %d" % (start + 1, start + len(window), n), ("dim",)))
+    if awaiting: segs.append((" · %d waiting on you" % awaiting, ("yellow",)))
     segs += [(" · daemon ", ("dim",)),
              ("on" if daemon_on else "off", ("green",) if daemon_on else ("dim",))]
     clock = datetime.now().strftime("%H:%M:%S")
@@ -434,13 +471,14 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "ACTION", "AGE",
                           ("dim",), ("dim",), ("dim",), ("dim",), ("dim",), header=True))
     if not items:
-        lines.append(_paint("  no tasks yet — handoff send ... to create one", ("dim",)))
-    for idx, i in enumerate(items):
+        lines.append(_paint("  No tasks yet — create one with: handoff send", ("dim",)))
+    for idx, i in enumerate(window):
+        here = start + idx == cursor
         ds = ("dim",) if i["closed"] else ()
         nxt, ns = next_cell(i)
-        glyph = "❯" if idx == cursor else ("▸" if i["mine"] else " ")
+        glyph = "❯" if here else ("▸" if i["mine"] else " ")
         box = "[x]" if i["id"] in selected else "[ ]"
-        ms = ("cyan",) if idx == cursor else (("yellow",) if i["mine"] else ds)
+        ms = ("cyan",) if here else (("yellow",) if i["mine"] else ds)
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
                               STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
                               ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i))
@@ -475,12 +513,12 @@ def toggle_daemon():
     """The daemon is a foreground process, so start it detached; stop just drops the stop file."""
     if daemon_running():
         try: (ROOT/"daemon.stop").touch()
-        except OSError: return "daemon stop failed"
-        return "daemon stopping"
+        except OSError: return "Could not stop the daemon"
+        return "Stopping the daemon — it exits within 5 seconds"
     subprocess.Popen([sys.executable, CLI, "daemon", "start"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    return "daemon starting"
+    return "Starting the daemon"
 
 def resend_tasks(ids, statuses):
     """Re-deliver each task's prompt, but only to a Target that is ready for input."""
@@ -490,11 +528,12 @@ def resend_tasks(ids, statuses):
     sent, skipped, failed = [], [], []
     for row in rows:
         if not row: continue
-        st = _lookup_status(statuses, row["target_agent"], row["target_pane"])
-        if st not in READY_STATUSES:
-            skipped.append("%s(%s)" % (row["target_agent"], st or "absent")); continue
-        if prompt(row["target_agent"], task_text(row)) is None: failed.append(row["target_agent"])
-        else: sent.append(row["target_agent"])
+        entry = _lookup_status(statuses, row["target_agent"], row["target_pane"])
+        who = live_label(entry, row["target_agent"])   # the pane may hold a renamed agent
+        if entry is None or entry[0] not in READY_STATUSES:
+            skipped.append("%s skipped — %s" % (who, not_ready_reason(entry))); continue
+        if prompt(who, task_text(row)) is None: failed.append(who)   # a stale name fails to resolve
+        else: sent.append(who)
     return sent, skipped, failed
 
 def ui(_):
@@ -511,7 +550,7 @@ def ui(_):
         termios.tcsetattr(fd, termios.TCSADRAIN, attr)
         sys.stdout.write("\033[?25l\033[H\033[2J")
         while True:
-            width = shutil.get_terminal_size((110, 30)).columns
+            size = shutil.get_terminal_size((110, 30)); width = size.columns
             if time.time() - last_status >= STATUS_TTL:
                 statuses = agent_statuses(max_age=0); last_status = time.time()
             items = board_items()
@@ -519,12 +558,13 @@ def ui(_):
             cursor = max(0, min(cursor, len(items)-1)) if items else 0
             if flash and time.time() > flash[1]: flash = None
             if mode == "confirm_delete":
-                message = ("Delete %d task(s)? %s   [y/N]" % (len(pending), ", ".join(pending)),
+                message = ("Delete %d task%s — %s?   y = yes, any other key = no"
+                           % (len(pending), "" if len(pending) == 1 else "s", ", ".join(pending)),
                            ("red",))
             elif flash: message = (flash[0], ("yellow",))
             else: message = None
-            sys.stdout.write("\033[H" + render_board(width, selected, cursor,
-                                                     statuses, items, message) + "\033[J")
+            sys.stdout.write("\033[H" + render_board(width, selected, cursor, statuses, items,
+                                                     message, height=size.lines) + "\033[J")
             sys.stdout.flush()
 
             key = _read_key(1.0)
@@ -535,9 +575,9 @@ def ui(_):
                     try: n = delete_tasks(c, pending)
                     finally: c.close()
                     selected -= set(pending)
-                    flash = ("Deleted %d task(s)" % n, time.time()+3)
+                    flash = ("Deleted %d task%s" % (n, "" if n == 1 else "s"), time.time()+3)
                 else:
-                    flash = ("Delete cancelled", time.time()+2)
+                    flash = ("Nothing was deleted", time.time()+2)
                 mode, pending = None, []
                 continue
             if key in ("q","Q"): break
@@ -553,16 +593,16 @@ def ui(_):
                 ids = {i["id"] for i in items}
                 selected = set() if ids and selected >= ids else set(ids)
             elif key == "r":
-                if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
+                if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else:
                     sent, skipped, failed = resend_tasks(sorted(selected), statuses)
                     parts = []
-                    if sent: parts.append("resent: " + ", ".join(sent))
-                    if skipped: parts.append("skipped not-ready: " + ", ".join(skipped))
-                    if failed: parts.append("failed: " + ", ".join(failed))
-                    flash = (" · ".join(parts) or "nothing to do", time.time()+4)
+                    if sent: parts.append("Re-sent to " + ", ".join(sent))
+                    parts += skipped                      # each is already a full clause
+                    for name in failed: parts.append("Could not reach %s" % name)
+                    flash = (" · ".join(parts) or "No task was re-sent", time.time()+5)
             elif key == "d":
-                if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
+                if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else: pending, mode = sorted(selected), "confirm_delete"
             elif key == "t":
                 flash = (toggle_daemon(), time.time()+3)

@@ -27,7 +27,7 @@ A 领取并验收：
 
 ```sh
 ./handoff claim <task-id>
-./handoff accept <task-id>
+./handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
 ```
 
 删除任务及其已保存结果：

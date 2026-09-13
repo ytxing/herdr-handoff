@@ -172,14 +172,10 @@ Task ID: <task-id>
 Description: <description>
 Result file: <result-file>
 
-B 已提交任务结果。请执行：
-handoff claim <task-id>
+B 已提交任务结果。请检查结果后执行：
+handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
 
-领取并检查后必须执行：
-handoff accept <task-id>
-
-需要修改时执行：
-handoff request-changes <task-id> --description "<要求>"
+`claim` 完成 Source 的检查并结束任务；需要修改时重新发布一个任务。
 ```
 
 ## 计时与重试
@@ -264,7 +260,6 @@ handoff daemon status
 任务控制：
 
 ```text
-handoff stop <task-id>    # 可恢复暂停
 handoff cancel <task-id>  # 永久取消
 ```
 
@@ -290,7 +285,7 @@ Last Error
 ## 第一条验收路径
 
 ```text
-send → take → done → claim → accept
+send → take → done → claim
 ```
 
-完成后再验证：B 忘记 take、B working 后忘记 done、A 忘记 claim、Agent absent、协议超时、执行退避、stop 和 cancel。
+完成后再验证：B 忘记 take、B working 后忘记 done、A 忘记 claim、Agent absent、协议超时、执行退避和 cancel。
