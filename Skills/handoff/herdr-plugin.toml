@@ -1,0 +1,24 @@
+id = "local.handoff"
+name = "Handoff"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Durable single-task A-to-B handoff coordinator"
+platforms = ["macos", "linux"]
+
+[[actions]]
+id = "ui"
+title = "Open Handoff Board"
+contexts = ["workspace", "pane"]
+command = ["python3", "handoff.py", "ui"]
+
+[[actions]]
+id = "daemon-status"
+title = "Handoff Daemon Status"
+contexts = ["workspace", "pane"]
+command = ["python3", "handoff.py", "daemon", "status"]
+
+[[panes]]
+id = "board"
+title = "Handoff Board"
+placement = "split"
+command = ["python3", "handoff.py", "ui"]
