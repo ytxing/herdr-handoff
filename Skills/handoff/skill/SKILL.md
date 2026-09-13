@@ -70,6 +70,9 @@ Inspect the saved result, then either accept or request changes:
 To remove a task and its saved result permanently, run `./handoff delete <task-id>` only
 when that deletion is intended.
 
+To remove a state class or all tasks, use `./handoff delete --state <state>` or
+`./handoff delete --all`.
+
 ## Daemon and board
 
 The daemon is manual; never assume it is running:

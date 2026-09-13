@@ -66,10 +66,15 @@ def cmd_action(a):
     elif a.cmd=="resume": transition(c,a.id,"active",row["action"],"resume")
     elif a.cmd=="cancel": transition(c,a.id,"cancelled","none","cancel")
     elif a.cmd=="delete":
-        if row["result_file"]:
-            try: Path(row["result_file"]).unlink()
-            except FileNotFoundError: pass
-        c.execute("delete from tasks where id=?", (a.id,)); c.commit()
+        rows = c.execute("select id,result_file from tasks where id=?", (a.id,)).fetchall() if a.id else c.execute("select id,result_file from tasks where state=?", (a.state,)).fetchall() if a.state else c.execute("select id,result_file from tasks").fetchall()
+        for item in rows:
+            if item["result_file"]:
+                try: Path(item["result_file"]).unlink()
+                except FileNotFoundError: pass
+        if a.id: c.execute("delete from tasks where id=?", (a.id,))
+        elif a.state: c.execute("delete from tasks where state=?", (a.state,))
+        else: c.execute("delete from tasks")
+        c.commit(); print(f"deleted {len(rows)} task(s)")
     elif a.cmd=="done-implicit":
         p=Path(a.result_file).expanduser()
         if not p.is_file(): raise SystemExit("result file is not readable")
@@ -270,8 +275,9 @@ def ui(_):
 def main():
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
     s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
-    for n in ("take","progress","claim","accept","reject","blocked","request-changes","stop","resume","cancel","delete","done-implicit"):
+    for n in ("take","progress","claim","accept","reject","blocked","request-changes","stop","resume","cancel","done-implicit"):
         x=sp.add_parser(n); x.add_argument("id"); x.add_argument("--reason", "--description", dest="reason", default=""); x.add_argument("--result-file"); x.set_defaults(fn=cmd_action,cmd=n)
+    x=sp.add_parser("delete"); x.add_argument("id", nargs="?"); x.add_argument("--state"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_action,cmd="delete")
     d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.set_defaults(fn=cmd_action,cmd="done")
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)
     d=sp.add_parser("daemon"); d.add_argument("op",choices=("start","stop","status")); d.set_defaults(fn=daemon)

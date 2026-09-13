@@ -36,6 +36,13 @@ A 领取并验收：
 ./handoff delete <task-id>
 ```
 
+按状态删除或清空全部任务：
+
+```sh
+./handoff delete --state finished
+./handoff delete --all
+```
+
 后台不会解析终端自然语言。B 必须显式执行 `take` 和 `done`；A 必须显式执行 `claim` 和 `accept`。有 handoff task 时，B 不要直接使用 `herdr agent prompt` 回报 A，统一通过 `handoff done`，由服务通知 A。
 
 ## 配置
