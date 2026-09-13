@@ -23,6 +23,9 @@ The sender must explicitly provide both Herdr identities; do not infer Source:
 ```
 
 `description` is required. The service verifies that both Agents exist through Herdr.
+After `send` returns a task ID, do not poll Target or run `herdr agent wait` in the Source
+turn. End the turn or continue unrelated work; the handoff daemon handles later reminders
+and result notification.
 
 ## Receiving and reporting
 
