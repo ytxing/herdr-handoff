@@ -59,14 +59,13 @@ When the result prompt arrives, run:
 ./handoff claim <task-id>
 ```
 
-Inspect the saved result, then either accept or request changes:
+Inspect the saved result, then mark the task finished:
 
 ```sh
-./handoff accept <task-id>
-./handoff request-changes <task-id> --description "<required changes>"
+./handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
 ```
 
-`claim` means received for review. `accept` is the final acceptance command and moves the task to `finished`.
+`claim` records the Source review and moves the task to `finished`. If changes are needed, send a new task.
 
 To remove a task and its saved result permanently, run `./handoff delete <task-id>` only
 when that deletion is intended.

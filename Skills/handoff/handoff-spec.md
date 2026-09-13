@@ -37,12 +37,9 @@ Herdr 负责 Agent、pane、状态查询和 Prompt 投递；handoff 负责任务
 published
 active
 result_ready
-reviewing
 finished
-changes_requested
 rejected
 timeout
-stopped
 cancelled
 source_absent
 target_absent
@@ -73,10 +70,7 @@ handoff done <task-id> --result-file <path>
 handoff done <task-id> --implicit-take --result-file <path>
 handoff blocked <task-id> --reason <text>
 handoff claim <task-id>
-handoff accept <task-id>
-handoff request-changes <task-id> --description <text>
 handoff reject <task-id> --reason <text>
-handoff stop <task-id>
 handoff cancel <task-id>
 handoff delete <task-id>
 ```
