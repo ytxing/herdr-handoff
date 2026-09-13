@@ -60,11 +60,19 @@ A 领取并验收：
 | `t` | 启动 / 停止 daemon |
 | `q` / `Ctrl-C` | 退出 |
 
-`r` 只对 Herdr 状态为 `idle` 或 `done` 的 Target 生效，其余跳过并在提示条**上方单独一行**列出被跳过的原因（`working`、`absent` 等）——提示不会盖住快捷键条。Herdr 本身不会拒绝向忙碌的 agent 投递 prompt，所以这道判断由看板负责，没有它就会打断正在进行的任务。
+`r` 只重发仍处于 `published` 或 `active` 的任务，且只投给 Herdr 状态为 `idle` 或 `done` 的 Target。其余一律跳过，原因列在提示条**上方单独一行**——提示不会盖住快捷键条。Herdr 本身不会拒绝向忙碌的 agent 投递 prompt，所以这道判断由看板负责，没有它就会打断正在进行的任务。重发的文本头部是 `[HANDOFF TASK — RE-SENT]` 并写明任务当前状态，让接收端能区分「催办」和「新任务」，不必自己去查记录、也不会把已交的活重做一遍。
 
 SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 覆盖全部 agent），不依赖 daemon 是否在运行。终端过窄时这两列会按阶梯收缩，到 43 列左右会先放弃路由再放弃 ACTION，再窄就只能换 `handoff list` 了。这个下限来自 DESCRIPTION 的 4 列保底宽度，会随状态标签与 AGE 的显示宽度浮动。
 
 `ACTION` 列是「下一步该谁敲哪条命令」：`take · h2` 表示等 h2 执行 `take`，`▶ accept` 表示轮到你执行 `accept`（`▶` 是拿你所在 pane 与任务的 source/target pane 比对得出的），`—` 表示任务已终结。这是读看板时最该先看的一列——handoff 的状态机只在有人执行显式命令时才前进。
+
+## 完成态的任务不可再推进
+
+任何会把**已终结**任务（`finished`、`rejected`、`cancelled`、`timeout`、`*_absent`）拉回活动状态的命令都会被拒绝，返回非零退出码并说明当前状态。覆盖 `take`、`progress`、`done`、`done-implicit`、`reply`、`blocked`、`reject`。
+
+没有这道守卫时，一个老实照提醒词敲命令的 agent 会把已验收的任务复活成 `active`，重做一遍，`done` 覆盖掉已存结果，并再通知 Source 一次。
+
+`claim` / `accept` 刻意不在守卫范围内——它们的落点就是 `finished`，重复执行是幂等重试，不是复活。
 
 ## 配置
 

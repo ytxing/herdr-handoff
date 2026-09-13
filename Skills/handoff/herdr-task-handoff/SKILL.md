@@ -100,10 +100,12 @@ The board is interactive and can act on tasks, not just display them:
 | `t` | start or stop the daemon |
 | `q`, `Ctrl-C` | quit |
 
-`r` delivers only to a Target whose Herdr status is `idle` or `done` (Herdr reports both
-as ready for input); every other task is skipped and the board names it on its own line
-above the key legend. Herdr itself does not refuse a prompt to a busy agent, so this check
-is what keeps the board from interrupting work already in progress.
+`r` re-sends only a task still open as `published` or `active`, and only to a Target whose
+Herdr status is `idle` or `done` (Herdr reports both as ready for input). Everything else is
+skipped and the board says why on its own line above the key legend. Herdr itself does not
+refuse a prompt to a busy agent, so this check is what keeps the board from interrupting work
+already in progress. A re-send is headed `[HANDOFF TASK — RE-SENT]` and names the state the
+task is still in, so the Target can tell a nudge from a new task.
 
 Protocol reminders default to 30 seconds. Execution and review backoff default to 2, 4,
 8 minutes and cap at 8 hours. If an expected Agent is `working`, the daemon first uses
@@ -111,3 +113,14 @@ Protocol reminders default to 30 seconds. Execution and review backoff default t
 
 If a pane moves or its terminal identity disappears, the task is marked absent. Re-select
 the Target and send a new task; the service does not migrate it automatically.
+
+## Closed tasks cannot be advanced
+
+A command that would move a closed task (`finished`, `rejected`, `cancelled`, `timeout`,
+`*_absent`) back into the live set is refused, with a non-zero exit and a message naming the
+current state. This covers `take`, `progress`, `done`, `done-implicit`, `reply`, `blocked` and
+`reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
+to `active`, redo the work, overwrite the saved result and notify the Source a second time.
+
+`claim` and `accept` are deliberately exempt: they land on `finished`, so re-running one is a
+harmless retry rather than a resurrection.

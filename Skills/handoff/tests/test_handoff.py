@@ -19,6 +19,12 @@ class HandoffTestBase(unittest.TestCase):
         self._conns.append(c)
         return c
 
+    def run_cli(self, *args):
+        env = os.environ.copy()
+        env["HANDOFF_STATE_DIR"] = self.tmp.name
+        return subprocess.run(["python3", str(ROOT / "handoff.py"), *args], env=env,
+                              text=True, capture_output=True)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self._conns = []
@@ -39,12 +45,6 @@ class HandoffTestBase(unittest.TestCase):
 
 
 class HandoffCliTests(HandoffTestBase):
-    def run_cli(self, *args):
-        env = os.environ.copy()
-        env["HANDOFF_STATE_DIR"] = self.tmp.name
-        return subprocess.run(["python3", str(ROOT / "handoff.py"), *args], env=env,
-                              text=True, capture_output=True)
-
     def setUp(self):
         super().setUp()
         c = self.db()
@@ -227,7 +227,7 @@ class BoardRenderTests(HandoffTestBase):
             self.assertLessEqual(dw(fit("中文中文中文", width)), width)
 
     def test_task_text_pins_the_wire_format(self):
-        """`send` and the board's resend key must deliver byte-identical text."""
+        """A first delivery is byte-exact: scripts and agents depend on this shape."""
         row = self.db().execute("select * from tasks where id='t_aaaa111122'").fetchone()
         cli = self.handoff.CLI
         expected = (
@@ -241,6 +241,53 @@ class BoardRenderTests(HandoffTestBase):
             % (cli, cli, cli, cli))
         self.assertEqual(self.handoff.task_text(row), expected)
 
+    def test_a_resend_is_marked_as_a_repeat(self):
+        """h2's second finding: a repeat must not read like a first delivery.
+
+        The Target otherwise cannot tell a stale nudge from a new task, and its only options
+        are to go inspect the record itself or to redo work that is already on file.
+        """
+        row = self.db().execute("select * from tasks where id='t_aaaa111122'").fetchone()
+        repeat = self.handoff.task_text(row, resend=True)
+        self.assertNotIn("RE-SENT", self.handoff.task_text(row))
+        self.assertIn("[HANDOFF TASK — RE-SENT]", repeat)
+        self.assertIn("still open as `published`", repeat)
+        self.assertIn("before redoing any work", repeat)
+
+    def test_resend_blocked_reasons(self):
+        reason = self.handoff.resend_blocked_reason
+        self.assertIn("already finished", reason("finished"))
+        self.assertIn("Source", reason("result_ready"),
+                      "a delivered task is waiting on the Source, not the Target")
+
+    def test_a_closed_task_cannot_be_resurrected(self):
+        """h2's third finding, and the damaging one: `take` had no state guard.
+
+        An agent obeying a stale reminder would set a finished task back to active, redo the
+        work, overwrite the saved result and notify the Source a second time.
+        """
+        c = self.db()
+        c.execute("update tasks set state='finished', action='none' where id='t_cccc555566'")
+        c.commit()
+        ident = ("--agent-name", "a", "--tab", "t", "--pane", "p")
+        cases = [("take", ident), ("progress", ()), ("reply", ("--message", "x")),
+                 ("reject", ("--reason", "no")), ("blocked", ("--reason", "stuck"))]
+        for command, extra in cases:
+            result = self.run_cli(command, "t_cccc555566", *extra)
+            self.assertNotEqual(result.returncode, 0, "%s on a closed task must be refused" % command)
+            self.assertIn("refused", result.stderr, command)
+            state = self.db().execute("select state from tasks where id='t_cccc555566'").fetchone()[0]
+            self.assertEqual(state, "finished",
+                             "%s moved a closed task out of its final state" % command)
+
+    def test_claim_on_a_closed_task_is_a_harmless_retry(self):
+        """claim/accept land on `finished`, so re-running one stays allowed."""
+        c = self.db()
+        c.execute("update tasks set state='finished' where id='t_cccc555566'")
+        c.commit()
+        result = self.run_cli("claim", "t_cccc555566", "--agent-name", "a", "--tab", "t", "--pane", "p")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_delete_tasks_removes_the_row_and_its_result_file(self):
         result = Path(self.tmp.name) / "r.md"
         result.write_text("x")
@@ -250,7 +297,7 @@ class BoardRenderTests(HandoffTestBase):
         self.assertEqual(self.handoff.delete_tasks(c, ["t_aaaa111122"]), 1)
         self.assertFalse(result.exists(), "the saved result file is removed too")
         self.assertIsNone(c.execute("select * from tasks where id='t_aaaa111122'").fetchone())
-        self.assertEqual(c.execute("select count(*) from tasks").fetchone()[0], 2,
+        self.assertEqual(c.execute("select count(*) from tasks").fetchone()[0], len(self.ROWS) - 1,
                          "unrelated tasks survive")
         self.assertEqual(self.handoff.delete_tasks(c, []), 0, "an empty id list is a no-op")
 
@@ -261,7 +308,7 @@ class BoardRenderTests(HandoffTestBase):
         self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
         try:
             delivered, skipped, failed = self.handoff.resend_tasks(
-                ["t_aaaa111122", "t_bbbb333344", "t_cccc555566"], self.statuses)
+                ["t_aaaa111122", "t_bbbb333344", "t_cccc555566", "t_dddd777777"], self.statuses)
         finally:
             self.handoff.prompt = original
         self.assertEqual(delivered, ["h2"], "h2 is idle, so it is the only delivery")
@@ -282,8 +329,7 @@ class BoardRenderTests(HandoffTestBase):
         parser = self.handoff.build_parser()
         for action in ("take", "done", "claim", "accept", "reply"):
             text = self.handoff.reminder_text({"id": "t_x", "description": "d"}, action)
-            self.assertIn("This task is waiting", text.replace("This task is blocked", "This task is waiting")
-                          + self.handoff.REMINDER_WHY.get(action, ""), "reminder must say why")
+            self.assertIn(self.handoff.REMINDER_WHY[action], text, "the reminder must say why")
             command = text.split("Run:\n", 1)[1].strip()
             for placeholder, value in filled.items():
                 command = command.replace(placeholder, value)
