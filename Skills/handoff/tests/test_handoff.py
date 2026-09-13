@@ -6,7 +6,38 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-class HandoffCliTests(unittest.TestCase):
+INSERT = ("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,"
+          "target_pane,state,action,state_since) values(?,?,?,?,?,?,?,?,?,?)")
+
+
+class HandoffTestBase(unittest.TestCase):
+    """Temp state dir plus a fresh module import. Connections opened via db() are closed in tearDown."""
+
+    def db(self):
+        c = self.handoff.conn()
+        self._conns.append(c)
+        return c
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._conns = []
+        os.environ["HANDOFF_STATE_DIR"] = self.tmp.name
+        import sys
+        sys.path.insert(0, str(ROOT))
+        sys.modules.pop("handoff", None)
+        import handoff
+        self.handoff = handoff
+
+    def tearDown(self):
+        for c in self._conns:
+            try: c.close()
+            except Exception: pass
+        os.environ.pop("HANDOFF_STATE_DIR", None)
+        os.environ.pop("HERDR_PANE_ID", None)
+        self.tmp.cleanup()
+
+
+class HandoffCliTests(HandoffTestBase):
     def run_cli(self, *args):
         env = os.environ.copy()
         env["HANDOFF_STATE_DIR"] = self.tmp.name
@@ -14,32 +45,22 @@ class HandoffCliTests(unittest.TestCase):
                               text=True, capture_output=True)
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        os.environ["HANDOFF_STATE_DIR"] = self.tmp.name
-        import sys
-        sys.path.insert(0, str(ROOT))
-        sys.modules.pop("handoff", None)
-        import handoff
-        self.handoff = handoff
-        c = handoff.conn()
-        c.execute("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,target_pane,state,action,state_since) values(?,?,?,?,?,?,?,?,?,?)",
-                  ("t_test", "测试任务", "prompt", "A", "p1", "B", "p2", "published", "take", handoff.now()))
+        super().setUp()
+        c = self.db()
+        c.execute(INSERT, ("t_test", "测试任务", "prompt", "A", "p1", "B", "p2",
+                           "published", "take", self.handoff.now()))
         c.commit()
-
-    def tearDown(self):
-        os.environ.pop("HANDOFF_STATE_DIR", None)
-        self.tmp.cleanup()
 
     def test_core_state_flow(self):
         result_file = Path(self.tmp.name) / "result.md"
         result_file.write_text("ok")
-        for command, expected in [(('take', 't_test'), 'active'),
-                                  (('done', 't_test', '--result-file', str(result_file)), 'result_ready'),
-                                  (('claim', 't_test'), 'reviewing'),
-                                  (('accept', 't_test'), 'finished')]:
+        identity = ('--agent-name', 'B', '--tab', 't1', '--pane', 'p2')
+        for command, expected in [(('take', 't_test', *identity), 'active'),
+                                  (('done', 't_test', '--result-file', str(result_file), *identity), 'result_ready'),
+                                  (('claim', 't_test', '--agent-name', 'A', '--tab', 't1', '--pane', 'p1'), 'finished')]:
             result = self.run_cli(*command)
             self.assertEqual(result.returncode, 0, result.stderr)
-            row = self.handoff.conn().execute("select state from tasks where id='t_test'").fetchone()
+            row = self.db().execute("select state from tasks where id='t_test'").fetchone()
             self.assertEqual(row[0], expected)
 
     def test_empty_description_rejected_by_parser(self):
@@ -52,7 +73,110 @@ class HandoffCliTests(unittest.TestCase):
     def test_delete_removes_task(self):
         result = self.run_cli("delete", "t_test")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIsNone(self.handoff.conn().execute("select * from tasks where id='t_test'").fetchone())
+        self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
+
+
+class BoardRenderTests(HandoffTestBase):
+    """The board is a pure function over an explicit task list, so it needs no terminal to test."""
+
+    ROWS = [("t_aaaa111122", "中文描述测试",         "prompt", "h1",      "wA:p2V", "h2",   "wA:p2W", "published", "take"),
+            ("t_bbbb333344", "an ascii description", "prompt", "t1-main", "wA:pH",  "gone", "wA:pZZ", "active",    "done"),
+            ("t_cccc555566", "短",                   "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "finished",  "none")]
+
+    def setUp(self):
+        super().setUp()
+        os.environ["HERDR_PANE_ID"] = "wA:p2V"
+        self.handoff._ANSI_ON = False
+        c = self.db()
+        for row in self.ROWS:
+            c.execute(INSERT, row + (self.handoff.now(),))
+        c.commit()
+        # Explicit statuses keep herdr out of the test; `gone` is deliberately unknown to it.
+        self.statuses = {"h1": "working", "h2": "idle", "wA:p2V": "working", "wA:p2W": "idle"}
+
+    def board(self, width, **kw):
+        return self.handoff.render_board(width, statuses=self.statuses,
+                                         items=self.handoff.board_items(), **kw)
+
+    def test_no_line_ever_exceeds_the_requested_width(self):
+        for width in range(43, 161):
+            for line in self.board(width, selected={"t_bbbb333344"}, cursor=1).split("\n"):
+                self.assertLessEqual(self.handoff._dw(line), width,
+                                     "width=%d produced %r" % (width, line))
+
+    def test_checkbox_and_cursor_render_on_the_right_rows(self):
+        lines = self.board(130, selected={"t_bbbb333344"}, cursor=1).split("\n")
+        cursors = [l for l in lines if l.startswith("❯")]
+        self.assertEqual(len(cursors), 1, "exactly one row carries the cursor")
+        self.assertIn("t_bbbb333344", cursors[0])
+        self.assertIn("[x]", cursors[0], "the cursor row is the one that was selected")
+        self.assertIn("[ ]", [l for l in lines if "t_aaaa111122" in l][0])
+
+    def test_status_columns_show_each_agent_and_its_state(self):
+        frame = self.board(150)
+        self.assertIn("h1 working", frame)
+        self.assertIn("h2 idle", frame)
+        self.assertIn("gone absent", frame, "an agent herdr does not know reads as absent")
+
+    def test_columns_shrink_in_ladder_order(self):
+        header = lambda w: self.board(w).split("\n")[2]
+        self.assertIn("SRC", header(150))
+        self.assertIn("DST", header(150))
+        self.assertTrue(any("ROUTE" in header(w) for w in range(150, 42, -1)),
+                        "ROUTE must appear as the fallback before routing is dropped entirely")
+        self.assertNotIn("working", self.board(43), "status words are the first thing dropped")
+        self.assertNotIn("ROUTE", header(43))
+
+    def test_cjk_measures_as_two_columns(self):
+        dw, fit = self.handoff._dw, self.handoff._fit
+        self.assertEqual(dw("中文"), 4)
+        self.assertEqual(dw("ab"), 2)
+        for width in range(1, 12):
+            self.assertLessEqual(dw(fit("中文中文中文", width)), width)
+
+    def test_task_text_pins_the_wire_format(self):
+        """`send` and the board's resend key must deliver byte-identical text."""
+        row = self.db().execute("select * from tasks where id='t_aaaa111122'").fetchone()
+        cli = self.handoff.CLI
+        expected = (
+            "[HANDOFF TASK]\nTask ID: t_aaaa111122\nDescription: 中文描述测试\n"
+            "Source: h1 / wA:p2V\nTarget: h2 / wA:p2W\n\n"
+            "Before any work, run:\npython3 %s take t_aaaa111122 --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n\n"
+            "Task:\nprompt\n\n"
+            "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n"
+            "If still working run:\npython3 %s progress t_aaaa111122\n"
+            'Only if refusing run:\npython3 %s reject t_aaaa111122 --reason "<reason>"'
+            % (cli, cli, cli, cli))
+        self.assertEqual(self.handoff.task_text(row), expected)
+
+    def test_delete_tasks_removes_the_row_and_its_result_file(self):
+        result = Path(self.tmp.name) / "r.md"
+        result.write_text("x")
+        c = self.db()
+        c.execute("update tasks set result_file=? where id='t_aaaa111122'", (str(result),))
+        c.commit()
+        self.assertEqual(self.handoff.delete_tasks(c, ["t_aaaa111122"]), 1)
+        self.assertFalse(result.exists(), "the saved result file is removed too")
+        self.assertIsNone(c.execute("select * from tasks where id='t_aaaa111122'").fetchone())
+        self.assertEqual(c.execute("select count(*) from tasks").fetchone()[0], 2,
+                         "unrelated tasks survive")
+        self.assertEqual(self.handoff.delete_tasks(c, []), 0, "an empty id list is a no-op")
+
+    def test_resend_targets_only_ready_agents(self):
+        """Herdr will deliver to a busy agent, so the board must gate on status itself."""
+        sent = []
+        original = self.handoff.prompt
+        self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
+        try:
+            delivered, skipped, failed = self.handoff.resend_tasks(
+                ["t_aaaa111122", "t_bbbb333344", "t_cccc555566"], self.statuses)
+        finally:
+            self.handoff.prompt = original
+        self.assertEqual(delivered, ["h2"], "h2 is idle, so it is the only delivery")
+        self.assertEqual(failed, [])
+        self.assertTrue(any("h1(working)" in s for s in skipped))
+        self.assertTrue(any("gone(absent)" in s for s in skipped))
+
 
 if __name__ == "__main__":
     unittest.main()

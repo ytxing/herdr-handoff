@@ -85,8 +85,26 @@ The daemon is manual; never assume it is running:
 ./handoff daemon stop
 ```
 
-The board is read-only and shows the current state, required action, Herdr presence and
-lifecycle, state start time, state duration, next retry, retry count, and errors.
+The board shows the current state, required action, per-agent Herdr status for both ends,
+state start time, state duration, next retry, retry count, and errors.
+
+The board is interactive and can act on tasks, not just display them:
+
+| Key | Action |
+|---|---|
+| `j` / `k`, `↓` / `↑` | move the cursor |
+| `space` | toggle the cursor row's checkbox |
+| `a` | select all / none |
+| `n` | re-send the stored prompt to the Targets of the checked tasks |
+| `d` | delete the checked tasks — asks for confirmation first |
+| `y`, `Enter` | confirm the pending delete; any other key cancels it |
+| `s` | start or stop the daemon |
+| `q`, `Ctrl-C` | quit |
+
+`n` delivers only to a Target whose Herdr status is `idle` or `done` (Herdr reports both
+as ready for input); every other task is skipped and the footer names it. Herdr itself
+does not refuse a prompt to a busy agent, so this check is what keeps the board from
+interrupting work already in progress.
 
 Protocol reminders default to 30 seconds. Execution and review backoff default to 2, 4,
 8 minutes and cap at 8 hours. If an expected Agent is `working`, the daemon first uses

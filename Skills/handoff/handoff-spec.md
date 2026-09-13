@@ -274,7 +274,7 @@ handoff stop <task-id>    # 可恢复暂停
 handoff cancel <task-id>  # 永久取消
 ```
 
-看板 `handoff ui` 只读本地状态，可作为普通终端程序，也可由 Herdr pane 启动。至少显示：
+看板 `handoff ui` 读本地状态，可作为普通终端程序，也可由 Herdr pane 启动。看板不只是展示，也可以直接操作任务：勾选后删除、或向 Target 重发已存 prompt，并可开关 daemon。至少显示：
 
 ```text
 Task ID

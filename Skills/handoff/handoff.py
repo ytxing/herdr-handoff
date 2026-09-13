@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Small, dependency-free Herdr handoff coordinator."""
-import argparse, json, os, shutil, sqlite3, subprocess, sys, time, unicodedata, uuid
+import argparse, json, os, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,9 +26,12 @@ def conn():
       retry_count integer not null default 0, result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
       source_presence text, target_presence text)""")
+    for name in ("source_tab", "target_tab"):
+        try: c.execute(f"alter table tasks add column {name} text")
+        except sqlite3.OperationalError: pass
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
-    c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=? where id=?",
+    c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
               (state,action,now(),last_action or action,now(),error,tid)); c.commit()
 def herdr(*args, timeout=20):
     try:
@@ -40,21 +43,60 @@ def prompt(agent, text):
     return herdr("agent","prompt",agent,text)
 def agent_get(agent): return herdr("agent","get",agent)
 
+def record_identity(c, row, a):
+    side = "target" if row["action"] in ("take", "done") else "source"
+    c.execute(f"update tasks set {side}_agent=?, {side}_tab=?, {side}_pane=? where id=?",
+              (a.agent_name, a.tab, a.pane, row["id"]))
+    c.commit()
+
+def delete_tasks(c, ids):
+    """Drop tasks by id: unlink each saved result file, then remove the rows. Returns count."""
+    ids = list(ids)
+    if not ids: return 0
+    marks = ",".join("?" * len(ids))
+    rows = c.execute("select id,result_file from tasks where id in (%s)" % marks, tuple(ids)).fetchall()
+    for item in rows:
+        if item["result_file"]:
+            try: Path(item["result_file"]).unlink()
+            except FileNotFoundError: pass
+    c.execute("delete from tasks where id in (%s)" % marks, tuple(ids)); c.commit()
+    return len(rows)
+
+def task_text(row):
+    """The prompt a Target receives for a task. Shared by `send` and the board's resend key."""
+    return ("[HANDOFF TASK]\nTask ID: {id}\nDescription: {description}\n"
+            "Source: {source_agent} / {source_pane}\nTarget: {target_agent} / {target_pane}\n\n"
+            "Before any work, run:\npython3 {cli} take {id} --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n\n"
+            "Task:\n{prompt}\n\n"
+            "On completion run:\npython3 {cli} done {id} --result-file <path> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n"
+            "If still working run:\npython3 {cli} progress {id}\n"
+            'Only if refusing run:\npython3 {cli} reject {id} --reason "<reason>"'
+            ).format(cli=CLI, id=row["id"], description=row["description"],
+                     source_agent=row["source_agent"], source_pane=row["source_pane"],
+                     target_agent=row["target_agent"], target_pane=row["target_pane"],
+                     prompt=row["prompt"])
+
 def cmd_send(a):
     if not a.description.strip(): raise SystemExit("description must not be empty")
     c=conn(); tid="t_"+uuid.uuid4().hex[:10]
+    if c.execute("select 1 from tasks where state not in ('finished','rejected','cancelled','timeout','target_absent','source_absent') limit 1").fetchone():
+        raise SystemExit("an unfinished task already exists")
     # Explicit source and target are required; validate when Herdr is available.
     if agent_get(a.source_agent) is None: raise SystemExit("source agent is absent or herdr is unavailable")
     if agent_get(a.target_agent) is None: raise SystemExit("target agent is absent or herdr is unavailable")
-    c.execute("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      (tid,a.description,a.prompt,a.source_agent,a.source_pane,a.target_agent,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
-    text=f"[HANDOFF TASK]\nTask ID: {tid}\nDescription: {a.description}\nSource: {a.source_agent} / {a.source_pane}\nTarget: {a.target_agent} / {a.target_pane}\n\nBefore any work, run:\npython3 {CLI} take {tid}\n\nTask:\n{a.prompt}\n\nOn completion run:\npython3 {CLI} done {tid} --result-file <path>\nIf still working run:\npython3 {CLI} progress {tid}\nOnly if refusing run:\npython3 {CLI} reject {tid} --reason \"<reason>\""
-    if prompt(a.target_agent,text) is None: transition(c,tid,"timeout","take",error="prompt failed")
+    c.execute("insert into tasks(id,description,prompt,source_agent,source_tab,source_pane,target_agent,target_tab,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      (tid,a.description,a.prompt,a.source_agent,a.source_tab,a.source_pane,a.target_agent,a.target_tab,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
+    row = {"id":tid, "description":a.description, "prompt":a.prompt,
+           "source_agent":a.source_agent, "source_pane":a.source_pane,
+           "target_agent":a.target_agent, "target_pane":a.target_pane}
+    if prompt(a.target_agent, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
     print(tid)
 
 def cmd_action(a):
     c=conn(); row=c.execute("select * from tasks where id=?",(a.id,)).fetchone()
     if not row: raise SystemExit("unknown task")
+    if a.cmd in ("take", "done", "done-implicit", "claim", "accept"):
+        record_identity(c, row, a)
     if a.cmd=="take": transition(c,a.id,"active","done","take")
     elif a.cmd=="progress": transition(c,a.id,"active","done","progress")
     elif a.cmd=="done":
@@ -63,29 +105,22 @@ def cmd_action(a):
         dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True); shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done")
         prompt(row["source_agent"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nRun:\npython3 {CLI} claim {a.id}\nThen inspect it and run:\npython3 {CLI} accept {a.id}\nOr:\npython3 {CLI} request-changes {a.id} --reason \"<要求>\"")
-    elif a.cmd=="claim": transition(c,a.id,"reviewing","accept","claim")
-    elif a.cmd=="accept": transition(c,a.id,"finished","none","accept")
+    elif a.cmd in ("claim", "accept"): transition(c,a.id,"finished","none",a.cmd)
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
     elif a.cmd=="blocked": transition(c,a.id,"active","reply","blocked",a.reason)
     elif a.cmd=="reply": transition(c,a.id,"active","done","reply",a.message)
-    elif a.cmd=="request-changes": transition(c,a.id,"active","done","request-changes",a.reason)
-    elif a.cmd=="stop": transition(c,a.id,"stopped","none","stop")
-    elif a.cmd=="resume": transition(c,a.id,"active",row["action"],"resume")
+    elif a.cmd=="request-changes": raise SystemExit("request-changes was removed; send a new task")
     elif a.cmd=="cancel": transition(c,a.id,"cancelled","none","cancel")
     elif a.cmd=="delete":
-        rows = c.execute("select id,result_file from tasks where id=?", (a.id,)).fetchall() if a.id else c.execute("select id,result_file from tasks where state=?", (a.state,)).fetchall() if a.state else c.execute("select id,result_file from tasks").fetchall()
-        for item in rows:
-            if item["result_file"]:
-                try: Path(item["result_file"]).unlink()
-                except FileNotFoundError: pass
-        if a.id: c.execute("delete from tasks where id=?", (a.id,))
-        elif a.state: c.execute("delete from tasks where state=?", (a.state,))
-        else: c.execute("delete from tasks")
-        c.commit(); print(f"deleted {len(rows)} task(s)")
+        if a.id: ids = [r["id"] for r in c.execute("select id from tasks where id=?", (a.id,))]
+        elif a.state: ids = [r["id"] for r in c.execute("select id from tasks where state=?", (a.state,))]
+        else: ids = [r["id"] for r in c.execute("select id from tasks")]
+        print(f"deleted {delete_tasks(c, ids)} task(s)")
     elif a.cmd=="done-implicit":
         p=Path(a.result_file).expanduser()
         if not p.is_file(): raise SystemExit("result file is not readable")
-        dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True); shutil.copyfile(p,dest)
+        dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True)
+        if p.resolve() != dest.resolve(): shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done-implicit")
 
 def cmd_list(_):
@@ -129,8 +164,6 @@ def daemon(a):
                     prompt(ag,f"[HANDOFF REMINDER]\nTask ID: {r['id']}\nDescription: {r['description']}\nRequired command: python3 {CLI} {r['action']} {r['id']}")
                     if protocol:
                         delay = PROTOCOL_ACK_TIMEOUT
-                    elif r["state"] == "reviewing":
-                        delay = min(REVIEW_BACKOFF_MAX, REVIEW_BACKOFF_INITIAL * (2 ** retries))
                     else:
                         delay = min(EXECUTION_BACKOFF_MAX, EXECUTION_BACKOFF_INITIAL * (2 ** retries))
                     c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+delay,timezone.utc).isoformat(),r['id'])); c.commit()
@@ -141,20 +174,20 @@ def daemon(a):
             except:pass
 # ---------- board rendering ----------
 
-CLOSED_STATES = ("finished","rejected","cancelled","stopped","timeout",
+CLOSED_STATES = ("finished","rejected","cancelled","timeout",
                  "target_absent","source_absent")
 STATE_LABEL = {"published":"published","active":"active","result_ready":"result ready",
-               "reviewing":"reviewing","finished":"finished","rejected":"rejected",
-               "cancelled":"cancelled","stopped":"stopped","timeout":"timeout",
+               "finished":"finished","rejected":"rejected",
+               "cancelled":"cancelled","timeout":"timeout",
                "target_absent":"target absent","source_absent":"source absent"}
 STATE_STYLE = {"published":("cyan",),"active":("cyan",),"result_ready":("boldblue",),
-               "reviewing":("boldyellow",),"finished":("boldgreen",),"rejected":("boldred",),
-               "cancelled":("dim",),"stopped":("dim",),"timeout":("boldred",),
+               "finished":("boldgreen",),"rejected":("boldred",),
+               "cancelled":("dim",),"timeout":("boldred",),
                "target_absent":("boldred",),"source_absent":("boldred",)}
 ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",
                 "reply":"reply","source_reply":"reply","none":"—"}
 _CODES = {"dim":"2","bold":"1","red":"31","green":"32","yellow":"33","blue":"34","cyan":"36",
-          "boldred":"1;31","boldgreen":"1;32","boldyellow":"1;33","boldblue":"1;34"}
+          "boldred":"1;31","boldgreen":"1;32","boldyellow":"1;33","boldblue":"1;34","boldcyan":"1;36"}
 _ANSI_ON = False
 
 def _use_color():
@@ -196,15 +229,54 @@ def _human_age(sec):
     if sec < 86400: return "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
     return "%dd%02dh" % (sec // 86400, sec % 86400 // 3600)
 
-def render_board(width=100):
+STATUS_STYLE = {"idle":("green",), "done":("green",), "working":("yellow",),
+                "blocked":("boldred",), "unknown":("dim",)}
+# Herdr reports `idle` and `done` alike as "ready for input"; both count as safe to prompt.
+READY_STATUSES = ("idle","done")
+STATUS_TTL = 1.0
+_STATUS_CACHE = {"at":0.0, "map":{}}
+
+def agent_statuses(max_age=STATUS_TTL):
+    """Map agent name AND pane id -> agent_status. One herdr call covers every agent."""
+    if time.time() - _STATUS_CACHE["at"] < max_age: return _STATUS_CACHE["map"]
+    data = herdr("agent","list", timeout=5)
+    if not data: return _STATUS_CACHE["map"]     # keep the last known map; retry next tick
+    m = {}
+    for ag in ((data.get("result") or {}).get("agents") or []):
+        st = ag.get("agent_status")
+        if not st: continue
+        if ag.get("name"): m[ag["name"]] = st
+        if ag.get("pane_id"): m[ag["pane_id"]] = st
+    _STATUS_CACHE.update(at=time.time(), map=m)
+    return m
+
+def _lookup_status(statuses, name, pane):
+    st = statuses.get(name) if name else None
+    return st if st is not None else (statuses.get(pane) if pane else None)
+
+def daemon_running():
+    """True only if the pid file names a live process — a stale file must not read as running."""
+    pidfile = ROOT/"daemon.pid"
+    if not pidfile.exists(): return False
+    try:
+        os.kill(int(pidfile.read_text().strip()), 0); return True
+    except (ValueError, OSError): return False
+
+def board_items():
+    """Query tasks and enrich each with routing, computed age and ownership."""
     me = os.environ.get("HERDR_PANE_ID")
+    c = conn()
+    try: rows = c.execute("select * from tasks order by state_since").fetchall()
+    finally: c.close()                      # the board redraws every second; do not leak connections
     items = []
-    for r in conn().execute("select * from tasks order by state_since"):
+    for r in rows:
         action = r["action"]; to_target = action in ("take","done")
         actor = r["target_agent"] if to_target else r["source_agent"]
         actor_pane = r["target_pane"] if to_target else r["source_pane"]
         items.append({
             "id": r["id"], "desc": r["description"].replace("\n"," / "),
+            "src_agent": r["source_agent"], "src_pane": r["source_pane"],
+            "dst_agent": r["target_agent"], "dst_pane": r["target_pane"],
             "route": "%s → %s" % (r["source_agent"], r["target_agent"]),
             "state": r["state"], "action": action, "actor": actor,
             "mine": (bool(me) and actor_pane == me and action != "none"
@@ -215,6 +287,18 @@ def render_board(width=100):
         })
     # live tasks first, finished ones sink to the bottom
     items.sort(key=lambda x: (x["closed"], x["since"]))
+    return items
+
+MARK_W = 4          # cursor glyph + "[x]" checkbox
+LEGEND = "j/k move · space pick · a all · n resend · d delete · s daemon · q quit"
+
+def render_board(width=100, selected=None, cursor=None, statuses=None, items=None, footer=None):
+    selected = selected or frozenset()
+    if statuses is None: statuses = agent_statuses()
+    if items is None: items = board_items()
+    for i in items:
+        i["src_status"] = _lookup_status(statuses, i["src_agent"], i["src_pane"])
+        i["dst_status"] = _lookup_status(statuses, i["dst_agent"], i["dst_pane"])
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
@@ -222,34 +306,78 @@ def render_board(width=100):
         if i["mine"]: return "▶ %s" % label, ("boldyellow",)
         return "%s · %s" % (label, i["actor"]), ("dim",)
 
-    kid = max([_dw("ID")] + [_dw(i["id"]) for i in items])
-    kst = max([_dw("STATE")] + [_dw(STATE_LABEL.get(i["state"], i["state"])) for i in items])
-    kag = max([_dw("AGE")] + [_dw(i["age"]) for i in items])
-    krt = max([_dw("ROUTE")] + [_dw(i["route"]) for i in items])
-    knx = max([_dw("NEXT")] + [_dw(next_cell(i)[0]) for i in items])
+    def name_of(i, which): return i["src_agent"] if which == "src" else i["dst_agent"]
+    def stat_of(i, which): return i["src_status"] if which == "src" else i["dst_status"]
+    def full_of(i, which): return "%s %s" % (name_of(i,which), stat_of(i,which) or "absent")
 
-    show_route = show_next = True
-    MIN_DESC = 18
+    def seg(i, which, dim):
+        base = ("dim",) if dim else ()
+        st = stat_of(i, which)
+        if st is None: return [(name_of(i,which), base), (" absent", ("dim",) if dim else ("boldred",))]
+        return [(name_of(i,which), base), (" %s" % st, ("dim",) if dim else STATUS_STYLE.get(st, ("dim",)))]
+
+    def widest(header, values):
+        return max([_dw(header)] + [_dw(v) for v in values])
+
+    kid = widest("ID", [i["id"] for i in items])
+    kst = widest("STATE", [STATE_LABEL.get(i["state"], i["state"]) for i in items])
+    kag = widest("AGE", [i["age"] for i in items])
+    knx = widest("NEXT", [next_cell(i)[0] for i in items])
+    krt = widest("ROUTE", [i["route"] for i in items])
+    ksf = widest("SRC", [full_of(i,"src") for i in items])
+    kdf = widest("DST", [full_of(i,"dst") for i in items])
+    ksn = widest("SRC", [name_of(i,"src") for i in items])
+    kdn = widest("DST", [name_of(i,"dst") for i in items])
+
+    # Narrowing ladder: full status columns, then names only, then one ROUTE column, then drop NEXT.
+    routing, show_next = "full", True
+    MIN_DESC = 12
+    def routing_w():
+        if routing == "full":  return ksf + 2 + kdf + 2
+        if routing == "names": return ksn + 2 + kdn + 2
+        if routing == "route": return krt + 2
+        return 0
     def fixed():
-        w = 1 + kid + kst + kag + 2*4
-        if show_route: w += krt + 2
+        w = MARK_W + kid + kst + kag + 2*4 + routing_w()
         if show_next: w += knx + 2
         return w
     while width - fixed() < MIN_DESC:
-        if show_route: show_route = False
+        if routing == "full": routing = "names"
+        elif routing == "names": routing = "route"
         elif show_next: show_next = False
+        elif routing == "route": routing = "none"
         else: break
-    desc_w = max(6, width - fixed())
+    desc_w = max(4, width - fixed())
 
     def row(cells):
+        """Each cell is (text_or_segments, styles, width, align); last cell is not padded."""
         parts = []
         for idx, (text, styles, w, align) in enumerate(cells):
-            parts.append(_paint(_pad(text, w, align == "r") if idx < len(cells)-1 else text, *styles))
+            if isinstance(text,(list,tuple)):
+                segs = list(text)
+            else:
+                if _dw(text) > w: text = _fit(text, w)   # a cell must never exceed its column
+                segs = [(text, styles)]
+            if idx < len(cells)-1:
+                gap = max(0, w - _dw("".join(s for s,_ in segs)))
+                segs = ([(" "*gap, ())] + segs) if align == "r" else (segs + [(" "*gap, ())])
+            parts.append("".join(_paint(s, st) for s, st in segs))
         return "  ".join(parts).rstrip()
 
-    def build(mark, _id, desc, route, state, nxt, age, ms, ds, ss, ns, as_):
-        cells = [(mark, ms, 1, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
-        if show_route: cells.append((route, ds, krt, "l"))
+    def routing_cells(i, dim, header):
+        if header:
+            if routing == "full":  return [("SRC",("dim",),ksf,"l"), ("DST",("dim",),kdf,"l")]
+            if routing == "names": return [("SRC",("dim",),ksn,"l"), ("DST",("dim",),kdn,"l")]
+            if routing == "route": return [("ROUTE",("dim",),krt,"l")]
+            return []
+        if routing == "full":  return [(seg(i,"src",dim),(),ksf,"l"), (seg(i,"dst",dim),(),kdf,"l")]
+        if routing == "names": return [(name_of(i,"src"),dim,ksn,"l"), (name_of(i,"dst"),dim,kdn,"l")]
+        if routing == "route": return [(i["route"], dim, krt, "l")]
+        return []
+
+    def assemble(mark, _id, desc, state, nxt, age, ms, ds, ss, ns, as_, i=None, header=False):
+        cells = [(mark, ms, MARK_W, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
+        cells += routing_cells(i, ds, header)
         cells.append((state, ss, kst, "l"))
         if show_next: cells.append((nxt, ns, knx, "l"))
         cells.append((age, as_, kag, "r"))
@@ -257,55 +385,169 @@ def render_board(width=100):
 
     n = len(items)
     awaiting = sum(1 for i in items if i["mine"] and not i["closed"])
-    left_plain = "Handoff · %d task%s" % (n, "" if n == 1 else "s")
-    left = _paint("Handoff", "bold") + _paint(" · %d task%s" % (n, "" if n == 1 else "s"), "dim")
-    if awaiting:
-        left_plain += " · %d awaiting you" % awaiting
-        left += _paint(" · %d awaiting you" % awaiting, "boldyellow")
+    daemon_on = daemon_running()
+    # Header is built from segments so it can be truncated instead of overrunning a narrow pane.
+    segs = [("Handoff", ("bold",)), (" · %d task%s" % (n, "" if n == 1 else "s"), ("dim",))]
+    if awaiting: segs.append((" · %d awaiting you" % awaiting, ("boldyellow",)))
+    segs += [(" · daemon ", ("dim",)),
+             ("on" if daemon_on else "off", ("green",) if daemon_on else ("dim",))]
     clock = datetime.now().strftime("%H:%M:%S")
-    lines = [left + " " * max(1, width - _dw(left_plain) - len(clock)) + _paint(clock, "dim"),
-             _paint("─" * width, "dim")]
-
-    lines.append(build("", "ID", "DESCRIPTION", "ROUTE", "STATE", "NEXT", "AGE",
-                       ("dim",), ("dim",), ("dim",), ("dim",), ("dim",)))
+    budget = max(0, width - len(clock) - 1)
+    head, used = [], 0
+    for txt, stl in segs:
+        if used + _dw(txt) > budget:
+            if budget - used > 1:
+                piece = _fit(txt, budget - used)
+                head.append((piece, stl)); used += _dw(piece)
+            break
+        head.append((txt, stl)); used += _dw(txt)
+    lines = ["".join(_paint(t, *s) for t, s in head)
+             + " " * max(1, width - used - len(clock)) + _paint(clock, "dim"),
+             _paint("─" * max(1, width), "dim")]
+    lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "NEXT", "AGE",
+                          ("dim",), ("dim",), ("dim",), ("dim",), ("dim",), header=True))
     if not items:
         lines.append(_paint("  no tasks yet — handoff send ... to create one", ("dim",)))
-    for i in items:
+    for idx, i in enumerate(items):
         ds = ("dim",) if i["closed"] else ()
         nxt, ns = next_cell(i)
-        lines.append(build("▸" if i["mine"] else " ", i["id"], _fit(i["desc"], desc_w),
-                           i["route"], STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
-                           ("boldyellow",) if i["mine"] else ds,
-                           ds, STATE_STYLE.get(i["state"], ()), ns, ds))
+        glyph = "❯" if idx == cursor else ("▸" if i["mine"] else " ")
+        box = "[x]" if i["id"] in selected else "[ ]"
+        ms = ("boldcyan",) if idx == cursor else (("boldyellow",) if i["mine"] else ds)
+        lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
+                              STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
+                              ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i))
     lines.append("")
-    legend = ("▸ your turn   ·   " if awaiting else "") + "refresh 1s   ·   Ctrl-C to quit"
-    lines.append(_paint(legend, ("dim",)))
+    if footer is None:
+        ftext, fstyles = LEGEND, ("dim",)
+    else:
+        ftext, fstyles = footer
+    lines.append(_paint(_fit(ftext, width), *fstyles))     # fit before painting, never after
     return "\n".join(lines)
+
+# ---------- interactive board ----------
+
+def _read_key(timeout):
+    """Return a key name ("UP"/"DOWN"/"ESC"), a literal character, or None on timeout."""
+    if not select.select([sys.stdin], [], [], timeout)[0]: return None
+    ch = sys.stdin.read(1)
+    if ch != "\033": return ch
+    if not select.select([sys.stdin], [], [], 0.03)[0]: return "ESC"      # bare Escape
+    if sys.stdin.read(1) != "[": return "ESC"
+    if not select.select([sys.stdin], [], [], 0.03)[0]: return "ESC"
+    return {"A":"UP","B":"DOWN","C":"RIGHT","D":"LEFT"}.get(sys.stdin.read(1))
+
+def toggle_daemon():
+    """The daemon is a foreground process, so start it detached; stop just drops the stop file."""
+    if daemon_running():
+        try: (ROOT/"daemon.stop").touch()
+        except OSError: return "daemon stop failed"
+        return "daemon stopping"
+    subprocess.Popen([sys.executable, CLI, "daemon", "start"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return "daemon starting"
+
+def resend_tasks(ids, statuses):
+    """Re-deliver each task's prompt, but only to a Target that is ready for input."""
+    c = conn()
+    try: rows = [c.execute("select * from tasks where id=?", (tid,)).fetchone() for tid in ids]
+    finally: c.close()
+    sent, skipped, failed = [], [], []
+    for row in rows:
+        if not row: continue
+        st = _lookup_status(statuses, row["target_agent"], row["target_pane"])
+        if st not in READY_STATUSES:
+            skipped.append("%s(%s)" % (row["target_agent"], st or "absent")); continue
+        if prompt(row["target_agent"], task_text(row)) is None: failed.append(row["target_agent"])
+        else: sent.append(row["target_agent"])
+    return sent, skipped, failed
 
 def ui(_):
     if not sys.stdout.isatty():
         print(render_board(shutil.get_terminal_size((110, 30)).columns)); return
     _use_color()
+    fd = sys.stdin.fileno(); saved = termios.tcgetattr(fd)
+    selected, cursor = set(), 0
+    mode, pending, flash = None, [], None
+    statuses, last_status = {}, 0.0
     try:
+        attr = termios.tcgetattr(fd)
+        attr[3] &= ~(termios.ICANON | termios.ECHO)   # cbreak; keep ISIG so Ctrl-C still works
+        termios.tcsetattr(fd, termios.TCSADRAIN, attr)
         sys.stdout.write("\033[?25l\033[H\033[2J")
         while True:
-            frame = render_board(shutil.get_terminal_size((110, 30)).columns)
-            sys.stdout.write("\033[H" + frame + "\033[J")
+            width = shutil.get_terminal_size((110, 30)).columns
+            if time.time() - last_status >= STATUS_TTL:
+                statuses = agent_statuses(max_age=0); last_status = time.time()
+            items = board_items()
+            if selected: selected &= {i["id"] for i in items}   # drop ids that vanished
+            cursor = max(0, min(cursor, len(items)-1)) if items else 0
+            if flash and time.time() > flash[1]: flash = None
+            if mode == "confirm_delete":
+                footer = ("Delete %d task(s)? %s   [y/N]" % (len(pending), ", ".join(pending)),
+                          ("boldred",))
+            elif flash: footer = (flash[0], ("boldyellow",))
+            else: footer = None
+            sys.stdout.write("\033[H" + render_board(width, selected, cursor,
+                                                     statuses, items, footer) + "\033[J")
             sys.stdout.flush()
-            time.sleep(1)
+
+            key = _read_key(1.0)
+            if key is None: continue
+            if mode == "confirm_delete":
+                if key in ("y","Y","\r","\n"):
+                    c = conn()
+                    try: n = delete_tasks(c, pending)
+                    finally: c.close()
+                    selected -= set(pending)
+                    flash = ("Deleted %d task(s)" % n, time.time()+3)
+                else:
+                    flash = ("Delete cancelled", time.time()+2)
+                mode, pending = None, []
+                continue
+            if key in ("q","Q"): break
+            if key in ("UP","k"): cursor = max(0, cursor-1)
+            elif key in ("DOWN","j"):
+                if items: cursor = min(len(items)-1, cursor+1)
+            elif key == " ":
+                if items:
+                    tid = items[cursor]["id"]
+                    if tid in selected: selected.discard(tid)
+                    else: selected.add(tid)
+            elif key == "a":
+                ids = {i["id"] for i in items}
+                selected = set() if ids and selected >= ids else set(ids)
+            elif key == "n":
+                if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
+                else:
+                    sent, skipped, failed = resend_tasks(sorted(selected), statuses)
+                    parts = []
+                    if sent: parts.append("resent: " + ", ".join(sent))
+                    if skipped: parts.append("skipped not-ready: " + ", ".join(skipped))
+                    if failed: parts.append("failed: " + ", ".join(failed))
+                    flash = (" · ".join(parts) or "nothing to do", time.time()+4)
+            elif key == "d":
+                if not selected: flash = ("Nothing selected - space to pick a row", time.time()+3)
+                else: pending, mode = sorted(selected), "confirm_delete"
+            elif key == "s":
+                flash = (toggle_daemon(), time.time()+3)
     except KeyboardInterrupt:
         pass
     finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write("\033[?25h\n")
         sys.stdout.flush()
 def main():
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
-    s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
-    for n in ("take","progress","claim","accept","reject","blocked","reply","request-changes","stop","resume","cancel","done-implicit"):
+    s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-tab",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-tab",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
+    for n in ("take","progress","claim","accept","reject","blocked","reply","cancel","done-implicit"):
         x=sp.add_parser(n); x.add_argument("id"); x.add_argument("--reason", "--description", dest="reason", default=""); x.add_argument("--result-file"); x.set_defaults(fn=cmd_action,cmd=n)
+        if n in ("take", "claim", "accept", "done-implicit"):
+            x.add_argument("--agent-name", required=True); x.add_argument("--tab", required=True); x.add_argument("--pane", required=True)
     sp_reply = sp.choices["reply"]; sp_reply.add_argument("--message", required=True)
     x=sp.add_parser("delete"); x.add_argument("id", nargs="?"); x.add_argument("--state"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_action,cmd="delete")
-    d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.set_defaults(fn=cmd_action,cmd="done")
+    d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.add_argument("--agent-name",required=True); d.add_argument("--tab",required=True); d.add_argument("--pane",required=True); d.set_defaults(fn=cmd_action,cmd="done")
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)
     d=sp.add_parser("daemon"); d.add_argument("op",choices=("start","stop","status")); d.set_defaults(fn=daemon)
     u=sp.add_parser("ui"); u.set_defaults(fn=ui)
