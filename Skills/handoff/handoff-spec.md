@@ -38,7 +38,7 @@ published
 active
 result_ready
 reviewing
-accepted
+finished
 changes_requested
 rejected
 timeout

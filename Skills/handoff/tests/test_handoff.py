@@ -36,7 +36,7 @@ class HandoffCliTests(unittest.TestCase):
         for command, expected in [(('take', 't_test'), 'active'),
                                   (('done', 't_test', '--result-file', str(result_file)), 'result_ready'),
                                   (('claim', 't_test'), 'reviewing'),
-                                  (('accept', 't_test'), 'accepted')]:
+                                  (('accept', 't_test'), 'finished')]:
             result = self.run_cli(*command)
             self.assertEqual(result.returncode, 0, result.stderr)
             row = self.handoff.conn().execute("select state from tasks where id='t_test'").fetchone()

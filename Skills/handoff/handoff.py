@@ -58,7 +58,7 @@ def cmd_action(a):
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done")
         prompt(row["source_agent"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nRun:\npython3 {CLI} claim {a.id}\nThen inspect it and run:\npython3 {CLI} accept {a.id}\nOr:\npython3 {CLI} request-changes {a.id} --reason \"<要求>\"")
     elif a.cmd=="claim": transition(c,a.id,"reviewing","accept","claim")
-    elif a.cmd=="accept": transition(c,a.id,"accepted","none","accept")
+    elif a.cmd=="accept": transition(c,a.id,"finished","none","accept")
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
     elif a.cmd=="blocked": transition(c,a.id,"active","source_reply","blocked",a.reason)
     elif a.cmd=="request-changes": transition(c,a.id,"active","done","request-changes",a.reason)
@@ -85,7 +85,7 @@ def daemon(a):
     try:
         while not (ROOT/"daemon.stop").exists():
             c=conn()
-            for r in c.execute("select * from tasks where state not in ('accepted','rejected','cancelled','stopped','timeout')").fetchall():
+            for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','stopped','timeout')").fetchall():
                 ag=r["target_agent"] if r["action"] in ("take","done") else r["source_agent"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
@@ -105,14 +105,14 @@ def daemon(a):
             except:pass
 # ---------- board rendering ----------
 
-CLOSED_STATES = ("accepted","rejected","cancelled","stopped","timeout",
+CLOSED_STATES = ("finished","rejected","cancelled","stopped","timeout",
                  "target_absent","source_absent")
 STATE_LABEL = {"published":"published","active":"active","result_ready":"result ready",
-               "reviewing":"reviewing","accepted":"accepted","rejected":"rejected",
+               "reviewing":"reviewing","finished":"finished","rejected":"rejected",
                "cancelled":"cancelled","stopped":"stopped","timeout":"timeout",
                "target_absent":"target absent","source_absent":"source absent"}
 STATE_STYLE = {"published":("cyan",),"active":("cyan",),"result_ready":("boldblue",),
-               "reviewing":("boldyellow",),"accepted":("boldgreen",),"rejected":("boldred",),
+               "reviewing":("boldyellow",),"finished":("boldgreen",),"rejected":("boldred",),
                "cancelled":("dim",),"stopped":("dim",),"timeout":("boldred",),
                "target_absent":("boldred",),"source_absent":("boldred",)}
 ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",

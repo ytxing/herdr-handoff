@@ -65,7 +65,7 @@ Inspect the saved result, then either accept or request changes:
 ./handoff request-changes <task-id> --description "<required changes>"
 ```
 
-`claim` means received for review. `accept` is the only final acceptance signal.
+`claim` means received for review. `accept` is the final acceptance command and moves the task to `finished`.
 
 ## Daemon and board
 
