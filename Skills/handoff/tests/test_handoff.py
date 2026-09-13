@@ -82,7 +82,9 @@ class BoardRenderTests(HandoffTestBase):
 
     ROWS = [("t_aaaa111122", "中文描述测试",         "prompt", "h1",      "wA:p2V", "h2",   "wA:p2W", "published", "take"),
             ("t_bbbb333344", "an ascii description", "prompt", "t1-main", "wA:pH",  "gone", "wA:pZZ", "active",    "done"),
-            ("t_cccc555566", "短",                   "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "finished",  "none")]
+            ("t_cccc555566", "短",                   "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "finished",  "none"),
+            # live task whose Target is busy, so the resend gate on agent status gets exercised
+            ("t_dddd777777", "目标在忙",              "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "active",    "done")]
 
     def setUp(self):
         super().setUp()
@@ -266,6 +268,42 @@ class BoardRenderTests(HandoffTestBase):
         self.assertEqual(failed, [])
         self.assertTrue(any("h1 skipped — it is working, not idle" == s for s in skipped), skipped)
         self.assertTrue(any("gone skipped — it is no longer in Herdr" == s for s in skipped), skipped)
+
+    def test_every_reminder_command_is_one_the_cli_accepts(self):
+        """Parse the emitted command with the real parser.
+
+        Twice now the daemon has handed an agent a command argparse rejects -- `source_reply`
+        was not a subcommand at all, and `reply` needs `--message`. Checking the generated text
+        against the actual parser is what catches that class of bug.
+        """
+        import shlex
+        filled = {"<your-agent>": "a", "<your-tab>": "t", "<your-pane>": "p",
+                  "<path>": "/tmp/result.md", '"<your answer>"': "yes"}
+        parser = self.handoff.build_parser()
+        for action in ("take", "done", "claim", "accept", "reply"):
+            text = self.handoff.reminder_text({"id": "t_x", "description": "d"}, action)
+            self.assertIn("This task is waiting", text.replace("This task is blocked", "This task is waiting")
+                          + self.handoff.REMINDER_WHY.get(action, ""), "reminder must say why")
+            command = text.split("Run:\n", 1)[1].strip()
+            for placeholder, value in filled.items():
+                command = command.replace(placeholder, value)
+            argv = shlex.split(command)[2:]          # drop "python3" and the script path
+            self.assertEqual(parser.parse_args(argv).op, action,
+                             "the %s reminder produced an unrunnable command" % action)
+
+    def test_resend_refuses_tasks_that_are_already_done(self):
+        sent = []
+        original = self.handoff.prompt
+        self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
+        try:
+            delivered, skipped, failed = self.handoff.resend_tasks(
+                ["t_cccc555566"], self.statuses)     # this row is finished
+        finally:
+            self.handoff.prompt = original
+        self.assertEqual(delivered, [], "a finished task must not be re-sent")
+        self.assertEqual(sent, [], "nothing reached the Target")
+        self.assertTrue(any("already finished" in s for s in skipped), skipped)
+        self.assertTrue(any("t_cccc555566" in s for s in skipped), "the skipped task is named")
 
     def test_a_renamed_agent_is_shown_by_its_current_name(self):
         """Agent names are not durable, so the pane's current occupant wins over the stored name.

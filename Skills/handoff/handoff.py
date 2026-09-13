@@ -62,19 +62,56 @@ def delete_tasks(c, ids):
     c.execute("delete from tasks where id in (%s)" % marks, tuple(ids)); c.commit()
     return len(rows)
 
-def task_text(row):
-    """The prompt a Target receives for a task. Shared by `send` and the board's resend key."""
-    return ("[HANDOFF TASK]\nTask ID: {id}\nDescription: {description}\n"
-            "Source: {source_agent} / {source_pane}\nTarget: {target_agent} / {target_pane}\n\n"
-            "Before any work, run:\npython3 {cli} take {id} --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n\n"
+def task_text(row, resend=False):
+    """The prompt a Target receives for a task; the board's resend key reuses it, marked as a repeat.
+
+    A repeat must not read like a first delivery. Otherwise the Target cannot tell a stale
+    nudge from a new task, and its only recourse is to go inspect the task record -- or to
+    redo work that is already on file.
+    """
+    head = "[HANDOFF TASK — RE-SENT]" if resend else "[HANDOFF TASK]"
+    repeat = ("\nThis repeats a task sent to you earlier. It is still open as `%s`."
+              " Check what you have already done before redoing any work.\n" % row["state"]) if resend else ""
+    return (head + "\nTask ID: {id}\nDescription: {description}\n"
+            "Source: {source_agent} / {source_pane}\nTarget: {target_agent} / {target_pane}\n"
+            + repeat + "\n"
+            "Before any work, run:\npython3 {cli} take {id} " + IDENTITY_ARGS + "\n\n"
             "Task:\n{prompt}\n\n"
-            "On completion run:\npython3 {cli} done {id} --result-file <path> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n"
+            "On completion run:\npython3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS + "\n"
             "If still working run:\npython3 {cli} progress {id}\n"
             'Only if refusing run:\npython3 {cli} reject {id} --reason "<reason>"'
             ).format(cli=CLI, id=row["id"], description=row["description"],
                      source_agent=row["source_agent"], source_pane=row["source_pane"],
                      target_agent=row["target_agent"], target_pane=row["target_pane"],
                      prompt=row["prompt"])
+
+IDENTITY_ARGS = "--agent-name <your-agent> --tab <your-tab> --pane <your-pane>"
+REMINDER_COMMAND = {
+    "take":   "python3 {cli} take {id} " + IDENTITY_ARGS,
+    "done":   "python3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS,
+    "claim":  "python3 {cli} claim {id} " + IDENTITY_ARGS,
+    "accept": "python3 {cli} accept {id} " + IDENTITY_ARGS,
+    "reply":  'python3 {cli} reply {id} --message "<your answer>"',
+}
+REMINDER_WHY = {
+    "take":   "This task is waiting for you to accept it.",
+    "done":   "You accepted this task but have not submitted a result yet.",
+    "claim":  "A result has been submitted and is waiting for you to look at it.",
+    "accept": "You reviewed a result but have not marked the task finished yet.",
+    "reply":  "This task is blocked on a question that only you can answer.",
+}
+
+def reminder_text(row, action):
+    """The nudge the daemon sends: says why, and gives the exact command for that action.
+
+    A generic `handoff {action} {id}` is not enough -- `reply` needs `--message`, so the
+    agent would be handed a command that argparse rejects.
+    """
+    command = REMINDER_COMMAND.get(action, "python3 {cli} {action} {id}").format(
+        cli=CLI, id=row["id"], action=action)
+    why = REMINDER_WHY.get(action, "This task is waiting on you.")
+    return ("[HANDOFF REMINDER]\nTask ID: {id}\nDescription: {desc}\n\n{why}\n\nRun:\n{cmd}"
+            ).format(id=row["id"], desc=row["description"], why=why, cmd=command)
 
 def cmd_send(a):
     if not a.description.strip(): raise SystemExit("description must not be empty")
@@ -95,6 +132,12 @@ def cmd_send(a):
 def cmd_action(a):
     c=conn(); row=c.execute("select * from tasks where id=?",(a.id,)).fetchone()
     if not row: raise SystemExit("unknown task")
+    # An agent obeying a stale reminder must not be able to resurrect a closed task: `take`
+    # would set it back to active, it would redo the work, `done` would overwrite the saved
+    # result and notify the Source a second time. The guard only blocks the transition OUT of
+    # a terminal state, so every live state behaves exactly as before.
+    if a.cmd in RESURRECTING_COMMANDS and row["state"] in CLOSED_STATES:
+        raise SystemExit("task %s is already %s; `%s` refused" % (a.id, row["state"], a.cmd))
     if a.cmd in ("take", "done", "done-implicit", "claim", "accept"):
         record_identity(c, row, a)
     if a.cmd=="take": transition(c,a.id,"active","done","take")
@@ -160,7 +203,7 @@ def daemon(a):
                     if protocol and retries >= PROTOCOL_ACK_RETRIES:
                         transition(c, r["id"], "timeout", "none", error="protocol acknowledgement timeout")
                         continue
-                    prompt(ag,f"[HANDOFF REMINDER]\nTask ID: {r['id']}\nDescription: {r['description']}\nRequired command: python3 {CLI} {r['action']} {r['id']}")
+                    prompt(ag, reminder_text(r, r["action"]))
                     if protocol:
                         delay = PROTOCOL_ACK_TIMEOUT
                     else:
@@ -175,6 +218,9 @@ def daemon(a):
 
 CLOSED_STATES = ("finished","rejected","cancelled","timeout",
                  "target_absent","source_absent")
+# Commands that would move a closed task back into the live set. `claim`/`accept` are absent on
+# purpose: they land on `finished`, so re-running one is a harmless retry, not a resurrection.
+RESURRECTING_COMMANDS = ("take","progress","done","done-implicit","reply","blocked","reject")
 STATE_LABEL = {"published":"published","active":"active","result_ready":"result ready",
                "finished":"finished","rejected":"rejected",
                "cancelled":"cancelled","timeout":"timeout",
@@ -520,6 +566,15 @@ def toggle_daemon():
                      stderr=subprocess.DEVNULL, start_new_session=True)
     return "Starting the daemon"
 
+# Only these states leave something for the Target to do. A finished task must not be
+# re-sent, and neither must one whose ball is already in the Source's court.
+RESENDABLE_STATES = ("published", "active")
+
+def resend_blocked_reason(state):
+    if state in CLOSED_STATES:
+        return "it is already %s" % STATE_LABEL.get(state, state)
+    return "the Target already delivered it, so the next move is the Source's"
+
 def resend_tasks(ids, statuses):
     """Re-deliver each task's prompt, but only to a Target that is ready for input."""
     c = conn()
@@ -528,11 +583,15 @@ def resend_tasks(ids, statuses):
     sent, skipped, failed = [], [], []
     for row in rows:
         if not row: continue
+        if row["state"] not in RESENDABLE_STATES:      # only the Target's own outstanding work
+            skipped.append("%s cannot be re-sent — %s"
+                           % (row["id"], resend_blocked_reason(row["state"])))
+            continue
         entry = _lookup_status(statuses, row["target_agent"], row["target_pane"])
         who = live_label(entry, row["target_agent"])   # the pane may hold a renamed agent
         if entry is None or entry[0] not in READY_STATUSES:
             skipped.append("%s skipped — %s" % (who, not_ready_reason(entry))); continue
-        if prompt(who, task_text(row)) is None: failed.append(who)   # a stale name fails to resolve
+        if prompt(who, task_text(row, resend=True)) is None: failed.append(who)  # a stale name won't resolve
         else: sent.append(who)
     return sent, skipped, failed
 
@@ -612,7 +671,8 @@ def ui(_):
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
         sys.stdout.write("\033[?25h\n")
         sys.stdout.flush()
-def main():
+def build_parser():
+    """Exposed so tests can check that a generated command is one the CLI actually accepts."""
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
     s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-tab",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-tab",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
     for n in ("take","progress","claim","accept","reject","blocked","reply","cancel","done-implicit"):
@@ -625,5 +685,8 @@ def main():
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)
     d=sp.add_parser("daemon"); d.add_argument("op",choices=("start","stop","status")); d.set_defaults(fn=daemon)
     u=sp.add_parser("ui"); u.set_defaults(fn=ui)
-    a=p.parse_args(); a.fn(a)
+    return p
+
+def main():
+    a=build_parser().parse_args(); a.fn(a)
 if __name__=="__main__": main()
