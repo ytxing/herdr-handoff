@@ -16,8 +16,8 @@ The sender must explicitly provide both Herdr identities; do not infer Source:
 
 ```sh
 ./handoff send \
-  --source-agent <source-agent> --source-pane <source-pane> \
-  --target-agent <target-agent> --target-pane <target-pane> \
+  --source-pane <source-pane> \
+  --target-pane <target-pane> \
   --description "<short or multiline description>" \
   --prompt "<task instructions>"
 ```
@@ -62,7 +62,7 @@ When the result prompt arrives, run:
 Inspect the saved result, then mark the task finished:
 
 ```sh
-./handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
+./handoff claim <task-id> --pane <your-pane>
 ```
 
 `claim` records the Source review and moves the task to `finished`. If changes are needed, send a new task.

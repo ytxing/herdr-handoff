@@ -55,18 +55,18 @@ class HandoffCliTests(HandoffTestBase):
     def test_core_state_flow(self):
         result_file = Path(self.tmp.name) / "result.md"
         result_file.write_text("ok")
-        identity = ('--agent-name', 'B', '--tab', 't1', '--pane', 'p2')
+        identity = ('--pane', 'wA:p2')
         for command, expected in [(('take', 't_test', *identity), 'active'),
                                   (('done', 't_test', '--result-file', str(result_file), *identity), 'result_ready'),
-                                  (('claim', 't_test', '--agent-name', 'A', '--tab', 't1', '--pane', 'p1'), 'finished')]:
+                                  (('claim', 't_test', '--pane', 'wA:p1'), 'finished')]:
             result = self.run_cli(*command)
             self.assertEqual(result.returncode, 0, result.stderr)
             row = self.db().execute("select state from tasks where id='t_test'").fetchone()
             self.assertEqual(row[0], expected)
 
     def test_empty_description_rejected_by_parser(self):
-        result = self.run_cli("send", "--source-agent", "A", "--source-pane", "p1",
-                              "--target-agent", "B", "--target-pane", "p2",
+        result = self.run_cli("send", "--source-pane", "wA:p1",
+                              "--target-pane", "wA:p2",
                               "--description", " ", "--prompt", "x")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description", result.stderr)
@@ -98,9 +98,11 @@ class BoardRenderTests(HandoffTestBase):
         # Each value is (agent_status, current name) as agent_statuses() returns them.
         self.statuses = {"h1": ("working", "h1"), "h2": ("idle", "h2"),
                          "wA:p2V": ("working", "h1"), "wA:p2W": ("idle", "h2")}
+        # pane -> tab, as pane_tabs() returns it. Passed in so no test reaches out to herdr.
+        self.tabs = {"wA:p2V": "wA:tN", "wA:p2W": "wA:tN", "wA:pH": "wA:tC", "wA:pZZ": "wA:tC"}
 
     def board(self, width, **kw):
-        return self.handoff.render_board(width, statuses=self.statuses,
+        return self.handoff.render_board(width, statuses=self.statuses, tabs=self.tabs,
                                          items=self.handoff.board_items(), **kw)
 
     def test_no_line_ever_exceeds_the_requested_width(self):
@@ -121,8 +123,9 @@ class BoardRenderTests(HandoffTestBase):
         frame = self.board(150)
         self.assertRegex(frame, r"h1\s+working")
         self.assertRegex(frame, r"h2\s+idle")
-        self.assertRegex(frame, r"t1-main\s+absent")
-        self.assertRegex(frame, r"gone\s+absent", "an agent herdr does not know reads as absent")
+        self.assertRegex(frame, r"\?:wA:pH\s+absent")
+        self.assertRegex(frame, r"\?:wA:pZZ\s+absent",
+                         "an unresolvable agent is shown by workspace:tab:pane, not its dead name")
         self.assertNotIn("●", frame, "status dots were dropped in favour of plain words")
         self.assertNotIn("○", frame)
 
@@ -203,6 +206,35 @@ class BoardRenderTests(HandoffTestBase):
         self.assertEqual(sorted(c for c in codes if c == "1" or c.startswith("1;")), [],
                          "bold was removed from the board on request")
 
+    def test_resend_summary_counts_tasks_without_naming_them(self):
+        """A task id would be the longest thing on the line and repeats what the board shows."""
+        summary = self.handoff.resend_summary(
+            ["h2"],
+            [("already finished", None), ("already finished", None),
+             ("it is working, not idle", "h1")],
+            ["h4"])
+        self.assertIn("Re-sent 1 task to h2", summary)
+        self.assertIn("2 tasks skipped — already finished", summary)
+        self.assertIn("h1 skipped — it is working, not idle", summary)
+        self.assertIn("Could not reach h4", summary)
+        self.assertNotIn("t_", summary, "no task ids in the message")
+
+    def test_resend_summary_when_nothing_happens(self):
+        self.assertEqual(self.handoff.resend_summary([], [], []), "No task was re-sent")
+
+    def test_every_line_is_erased_as_it_is_written(self):
+        """Writing text does not clear the rest of the line.
+
+        Replacing the multi-task resend message with the shorter delete confirmation stranded
+        the old tail on screen: the trailing \\033[J clears below the cursor, which by then is
+        already on the last line.
+        """
+        out = self.handoff.frame_bytes("aa\nbb\ncc")
+        self.assertTrue(out.startswith("\033[H"))
+        for line in ("aa", "bb", "cc"):
+            self.assertIn(line + "\033[K", out, "each line must erase its own tail")
+        self.assertTrue(out.endswith("\033[K\033[J"))
+
     def test_last_two_lines_are_reserved(self):
         """The message line and the legend are always the final two lines, empty or not."""
         for msg in (None, ("Resent to h2", ("boldyellow",))):
@@ -232,10 +264,10 @@ class BoardRenderTests(HandoffTestBase):
         cli = self.handoff.CLI
         expected = (
             "[HANDOFF TASK]\nTask ID: t_aaaa111122\nDescription: 中文描述测试\n"
-            "Source: h1 / wA:p2V\nTarget: h2 / wA:p2W\n\n"
-            "Before any work, run:\npython3 %s take t_aaaa111122 --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n\n"
+            "Source: wA:p2V\nTarget: wA:p2W\n\n"
+            "Before any work, run:\npython3 %s take t_aaaa111122 --pane <your-pane>\n\n"
             "Task:\nprompt\n\n"
-            "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>\n"
+            "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --pane <your-pane>\n"
             "If still working run:\npython3 %s progress t_aaaa111122\n"
             'Only if refusing run:\npython3 %s reject t_aaaa111122 --reason "<reason>"'
             % (cli, cli, cli, cli))
@@ -269,7 +301,7 @@ class BoardRenderTests(HandoffTestBase):
         c = self.db()
         c.execute("update tasks set state='finished', action='none' where id='t_cccc555566'")
         c.commit()
-        ident = ("--agent-name", "a", "--tab", "t", "--pane", "p")
+        ident = ("--pane", "wA:p1")
         cases = [("take", ident), ("progress", ()), ("reply", ("--message", "x")),
                  ("reject", ("--reason", "no")), ("blocked", ("--reason", "stuck"))]
         for command, extra in cases:
@@ -285,7 +317,7 @@ class BoardRenderTests(HandoffTestBase):
         c = self.db()
         c.execute("update tasks set state='finished' where id='t_cccc555566'")
         c.commit()
-        result = self.run_cli("claim", "t_cccc555566", "--agent-name", "a", "--tab", "t", "--pane", "p")
+        result = self.run_cli("claim", "t_cccc555566", "--pane", "wA:p1")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_delete_tasks_removes_the_row_and_its_result_file(self):
@@ -308,13 +340,15 @@ class BoardRenderTests(HandoffTestBase):
         self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
         try:
             delivered, skipped, failed = self.handoff.resend_tasks(
-                ["t_aaaa111122", "t_bbbb333344", "t_cccc555566", "t_dddd777777"], self.statuses)
+                ["t_aaaa111122", "t_bbbb333344", "t_cccc555566", "t_dddd777777"],
+                self.statuses, self.tabs)
         finally:
             self.handoff.prompt = original
         self.assertEqual(delivered, ["h2"], "h2 is idle, so it is the only delivery")
         self.assertEqual(failed, [])
-        self.assertTrue(any("h1 skipped — it is working, not idle" == s for s in skipped), skipped)
-        self.assertTrue(any("gone skipped — it is no longer in Herdr" == s for s in skipped), skipped)
+        self.assertIn(("it is working, not idle", "h1"), skipped)
+        self.assertIn(("it is no longer in Herdr", "?:wA:pZZ"), skipped,
+                      "a vanished agent is named by its pane, not its dead name")
 
     def test_every_reminder_command_is_one_the_cli_accepts(self):
         """Parse the emitted command with the real parser.
@@ -348,8 +382,8 @@ class BoardRenderTests(HandoffTestBase):
             self.handoff.prompt = original
         self.assertEqual(delivered, [], "a finished task must not be re-sent")
         self.assertEqual(sent, [], "nothing reached the Target")
-        self.assertTrue(any("already finished" in s for s in skipped), skipped)
-        self.assertTrue(any("t_cccc555566" in s for s in skipped), "the skipped task is named")
+        self.assertEqual(skipped, [("already finished", None)],
+                         "a task-level reason is counted, not tied to an id")
 
     def test_a_renamed_agent_is_shown_by_its_current_name(self):
         """Agent names are not durable, so the pane's current occupant wins over the stored name.
@@ -360,9 +394,64 @@ class BoardRenderTests(HandoffTestBase):
         lookup, label = self.handoff._lookup_status, self.handoff.live_label
         statuses = {"h3": ("working", "h3"), "wA:p2Y": ("working", "h3")}
         entry = lookup(statuses, "h3-main", "wA:p2Y")          # stored name is stale
-        self.assertEqual(label(entry, "h3-main"), "h3", "show who is in the pane now")
+        self.assertEqual(label(entry, "h3-main", "wA:p2Y"), "h3", "show who is in the pane now")
         self.assertIsNone(lookup(statuses, "h3-main", "wA:pZZ"), "an unknown pane resolves to nothing")
-        self.assertEqual(label(None, "h3-main"), "h3-main", "fall back to the recorded name")
+
+    def test_the_pane_wins_when_the_old_name_has_been_taken(self):
+        """Names get reused; the pane is what the task is bound to, so it is asked first."""
+        lookup = self.handoff._lookup_status
+        statuses = {"h3-main": ("idle", "h3-main"),     # a different agent now holds the old name
+                    "wA:p2Y": ("working", "h9")}        # the original, renamed, still in its pane
+        self.assertEqual(lookup(statuses, "h3-main", "wA:p2Y"), ("working", "h9"))
+
+    def test_pane_ref_carries_workspace_tab_and_pane(self):
+        ref = self.handoff.pane_ref
+        self.assertEqual(ref("wA:p2Y", "wA:tN"), "wA:p2Y", "Herdr pane id is already native")
+        self.assertEqual(ref("wA:p2Y"), "wA:p2Y", "with no tab known the pane still locates it")
+        self.assertEqual(ref("wA:p2Y", "h3"), "wA:p2Y")
+        self.assertEqual(ref("wA:p2Y", "wB:t1"), "wA:p2Y")
+
+    def test_an_unresolvable_agent_is_shown_as_a_marked_pane(self):
+        """A name that no longer exists helps nobody; the pane id is the durable locator."""
+        label = self.handoff.live_label
+        self.assertEqual(label(None, "h3-main", "wA:p2Y"), "?:wA:p2Y",
+                         "the question mark stands in for the agent that is gone")
+        self.assertEqual(label(None, "h3-main"), "h3-main",
+                         "nothing durable recorded, so the stored name is all there is")
+        self.assertEqual(label(("idle", "h3"), "h3-main", "wA:p2Y"), "h3",
+                         "a live agent still wins")
+        self.assertEqual(label(("idle", None), "h3-main", "wA:p2Y"), "?:wA:p2Y",
+                         "present but unnamed is still unresolved")
+
+    def test_the_unknown_agent_label_is_red(self):
+        self.handoff._ANSI_ON = True
+        try:
+            row = [l for l in self.board(150).split("\n") if "t_bbbb333344" in l][0]
+        finally:
+            self.handoff._ANSI_ON = False
+        self.assertIn("\033[31m?:wA:pZZ", row, "the stale-agent marker is red")
+        self.assertNotIn("\033[31mh1", row, "a resolved agent name is not")
+
+    def test_resend_addresses_a_real_target_not_the_display_label(self):
+        """The display label may be a shortened pane reference that herdr cannot resolve."""
+        sent = []
+        original = self.handoff.prompt
+        self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
+        c = self.db()
+        # renamed Target: stored name is stale, the pane holds an unnamed live agent
+        c.execute("update tasks set target_agent='old-name', target_pane='wA:p2Y'"
+                  " where id='t_aaaa111122'")
+        c.commit()
+        statuses = {"wA:p2Y": ("idle", None)}
+        try:
+            delivered, skipped, failed = self.handoff.resend_tasks(
+                ["t_aaaa111122"], statuses, tabs={})   # tabs={} forces the recorded tab to be used
+        finally:
+            self.handoff.prompt = original
+        self.assertEqual(sent, ["wA:p2Y"], "the raw pane id is addressable; the label is not")
+        self.assertEqual(delivered, ["?:wA:p2Y"], "the report names it by its display label")
+        self.assertEqual(skipped, [])
+        self.assertEqual(failed, [])
 
 
 if __name__ == "__main__":

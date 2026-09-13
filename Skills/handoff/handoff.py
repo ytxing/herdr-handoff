@@ -26,9 +26,6 @@ def conn():
       retry_count integer not null default 0, result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
       source_presence text, target_presence text)""")
-    for name in ("source_tab", "target_tab"):
-        try: c.execute(f"alter table tasks add column {name} text")
-        except sqlite3.OperationalError: pass
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
     c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
@@ -45,8 +42,7 @@ def agent_get(agent): return herdr("agent","get",agent)
 
 def record_identity(c, row, a):
     side = "target" if row["action"] in ("take", "done") else "source"
-    c.execute(f"update tasks set {side}_agent=?, {side}_tab=?, {side}_pane=? where id=?",
-              (a.agent_name, a.tab, a.pane, row["id"]))
+    c.execute(f"update tasks set {side}_pane=? where id=?", (a.pane, row["id"]))
     c.commit()
 
 def delete_tasks(c, ids):
@@ -73,19 +69,18 @@ def task_text(row, resend=False):
     repeat = ("\nThis repeats a task sent to you earlier. It is still open as `%s`."
               " Check what you have already done before redoing any work.\n" % row["state"]) if resend else ""
     return (head + "\nTask ID: {id}\nDescription: {description}\n"
-            "Source: {source_agent} / {source_pane}\nTarget: {target_agent} / {target_pane}\n"
+            "Source: {source_pane}\nTarget: {target_pane}\n"
             + repeat + "\n"
-            "Before any work, run:\npython3 {cli} take {id} " + IDENTITY_ARGS + "\n\n"
+            "Before any work, run:\npython3 {cli} take {id} --pane <your-pane>\n\n"
             "Task:\n{prompt}\n\n"
-            "On completion run:\npython3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS + "\n"
+            "On completion run:\npython3 {cli} done {id} --result-file <path> --pane <your-pane>\n"
             "If still working run:\npython3 {cli} progress {id}\n"
             'Only if refusing run:\npython3 {cli} reject {id} --reason "<reason>"'
             ).format(cli=CLI, id=row["id"], description=row["description"],
-                     source_agent=row["source_agent"], source_pane=row["source_pane"],
-                     target_agent=row["target_agent"], target_pane=row["target_pane"],
+                     source_pane=row["source_pane"], target_pane=row["target_pane"],
                      prompt=row["prompt"])
 
-IDENTITY_ARGS = "--agent-name <your-agent> --tab <your-tab> --pane <your-pane>"
+IDENTITY_ARGS = "--pane <your-pane>"
 REMINDER_COMMAND = {
     "take":   "python3 {cli} take {id} " + IDENTITY_ARGS,
     "done":   "python3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS,
@@ -119,14 +114,14 @@ def cmd_send(a):
     if c.execute("select 1 from tasks where state not in ('finished','rejected','cancelled','timeout','target_absent','source_absent') limit 1").fetchone():
         raise SystemExit("an unfinished task already exists")
     # Explicit source and target are required; validate when Herdr is available.
-    if agent_get(a.source_agent) is None: raise SystemExit("source agent is absent or herdr is unavailable")
-    if agent_get(a.target_agent) is None: raise SystemExit("target agent is absent or herdr is unavailable")
-    c.execute("insert into tasks(id,description,prompt,source_agent,source_tab,source_pane,target_agent,target_tab,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      (tid,a.description,a.prompt,a.source_agent,a.source_tab,a.source_pane,a.target_agent,a.target_tab,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
+    if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
+    if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")
+    c.execute("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      (tid,a.description,a.prompt,"",a.source_pane,"",a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
     row = {"id":tid, "description":a.description, "prompt":a.prompt,
-           "source_agent":a.source_agent, "source_pane":a.source_pane,
-           "target_agent":a.target_agent, "target_pane":a.target_pane}
-    if prompt(a.target_agent, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
+           "source_agent":"", "source_pane":a.source_pane,
+           "target_agent":"", "target_pane":a.target_pane}
+    if prompt(a.target_pane, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
     print(tid)
 
 def cmd_action(a):
@@ -147,7 +142,7 @@ def cmd_action(a):
         if not p.is_file() or not os.access(p,os.R_OK): raise SystemExit("result file is not readable")
         dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True); shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done")
-        prompt(row["source_agent"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --agent-name <your-agent> --tab <your-tab> --pane <your-pane>")
+        prompt(row["source_pane"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --pane <your-pane>")
     elif a.cmd in ("claim", "accept"): transition(c,a.id,"finished","none",a.cmd)
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
     elif a.cmd=="blocked": transition(c,a.id,"active","reply","blocked",a.reason)
@@ -183,7 +178,7 @@ def daemon(a):
         while not (ROOT/"daemon.stop").exists():
             c=conn()
             for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
-                ag=r["target_agent"] if r["action"] in ("take","done") else r["source_agent"]
+                ag=r["target_pane"] if r["action"] in ("take","done") else r["source_pane"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
                     result = info.get("result", info) if isinstance(info,dict) else {}
@@ -316,13 +311,45 @@ def agent_statuses(max_age=STATUS_TTL):
     _STATUS_CACHE.update(at=time.time(), map=m)
     return m
 
-def _lookup_status(statuses, name, pane):
-    entry = statuses.get(name) if name else None
-    return entry if entry is not None else (statuses.get(pane) if pane else None)
+_PANE_TAB_CACHE = {"at":0.0, "map":{}}
 
-def live_label(entry, stored_name):
-    """The agent name to display: whoever is in the pane now, falling back to the recorded name."""
-    return (entry[1] if entry and entry[1] else None) or stored_name
+def pane_tabs(max_age=STATUS_TTL):
+    """Map pane id -> tab id. Unlike `agent list`, this still knows panes whose agent has gone,
+    which is the only way to name the tab of a task whose Target has since disappeared."""
+    if time.time() - _PANE_TAB_CACHE["at"] < max_age: return _PANE_TAB_CACHE["map"]
+    data = herdr("pane","list", timeout=5)
+    if not data: return _PANE_TAB_CACHE["map"]
+    m = {p["pane_id"]: p["tab_id"]
+         for p in ((data.get("result") or {}).get("panes") or [])
+         if p.get("pane_id") and p.get("tab_id")}
+    _PANE_TAB_CACHE.update(at=time.time(), map=m)
+    return m
+
+def _lookup_status(statuses, name, pane):
+    """Resolve one side of a task to a live agent.
+
+    The pane is asked first because it is what the task is actually bound to -- record_identity
+    refreshes it on every protocol command -- while a name is only a hint. Names get reused: if
+    another agent has since taken the old name, asking by name returns that impostor and the
+    renamed original, still sitting in its pane, is never found.
+    """
+    entry = statuses.get(pane) if pane else None
+    return entry if entry is not None else (statuses.get(name) if name else None)
+
+def pane_ref(pane, tab=None):
+    """Return Herdr's native pane locator; tab is display-only metadata."""
+    return pane or None
+
+def live_label(entry, stored_name, pane=None, tab=None):
+    """What to print for one side of a task.
+
+    A resolvable agent is shown by the name it goes by now. When it cannot be resolved the
+    name recorded at send time is worthless -- that is precisely the name that no longer
+    exists -- so the ? takes its place and the pane's coordinates are printed instead.
+    """
+    if entry and entry[1]: return entry[1]
+    ref = pane_ref(pane, tab)
+    return ("?:" + ref) if ref else stored_name
 
 NOT_READY_REASON = {"working": "it is working, not idle",
                     "blocked": "it is waiting on an approval dialog",
@@ -383,15 +410,23 @@ def _legend_segments():
 BOARD_CHROME = 6      # title, rule, column header, blank, message line, legend
 
 def render_board(width=100, selected=None, cursor=None, statuses=None, items=None,
-                 message=None, height=None):
+                 message=None, height=None, tabs=None):
     selected = selected or frozenset()
     if statuses is None: statuses = agent_statuses()
     if items is None: items = board_items()
+    if tabs is None: tabs = pane_tabs()
     for i in items:
         i["src_status"] = _lookup_status(statuses, i["src_agent"], i["src_pane"])
         i["dst_status"] = _lookup_status(statuses, i["dst_agent"], i["dst_pane"])
-        i["src_label"] = live_label(i["src_status"], i["src_agent"])
-        i["dst_label"] = live_label(i["dst_status"], i["dst_agent"])
+        # Live pane -> tab mapping first: a pane can be moved between tabs, and the mapping
+        # survives the agent. The tab recorded at send time is only a fallback.
+        i["src_label"] = live_label(i["src_status"], i["src_agent"], i["src_pane"],
+                                    None)
+        i["dst_label"] = live_label(i["dst_status"], i["dst_agent"], i["dst_pane"],
+                                    None)
+        i["src_known"] = bool(i["src_status"] and i["src_status"][1])
+        i["dst_known"] = bool(i["dst_status"] and i["dst_status"][1])
+        i["route"] = "%s → %s" % (i["src_label"], i["dst_label"])
         # ACTION names the actor too, so it needs the same resolution as the SRC/DST columns.
         i["actor_label"] = i["dst_label"] if i["actor"] == i["dst_agent"] else i["src_label"]
 
@@ -428,10 +463,14 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         """
         name, st = name_of(i, which), stat_of(i, which)
         name_w = ksn if which == "src" else kdn
+        known = i["src_known"] if which == "src" else i["dst_known"]
         word = "absent" if st is None else st
         style = ("red",) if st is None else STATUS_STYLE.get(st, ("dim",))
+        # `?:pane` means the agent could not be resolved. It stays red even on a dimmed row,
+        # the same way the status word keeps its colour there.
+        name_style = (("dim",) if dim else ()) if known else ("red",)
         name_text = _pad(name, name_w) + " "
-        return name_text + word, [(name_text, ("dim",) if dim else ()), (word, style)]
+        return name_text + word, [(name_text, name_style), (word, style)]
 
     ksf = widest("SRC", [status_cell(i,"src",False)[0] for i in items])
     kdf = widest("DST", [status_cell(i,"dst",False)[0] for i in items])
@@ -537,6 +576,15 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
 
 # ---------- interactive board ----------
 
+def frame_bytes(frame):
+    """Encode a frame for the terminal, erasing each line's tail as it is written.
+
+    Overwriting a long message with a shorter one otherwise strands the old tail on screen:
+    writing text does not clear the rest of the line, and a trailing \\033[J only clears below
+    the cursor, which by then sits on the last line.
+    """
+    return "\033[H" + "\033[K\n".join(frame.split("\n")) + "\033[K\033[J"
+
 def _read_key(timeout):
     """Return a key name ("UP"/"DOWN"/"ESC"), a literal character, or None on timeout.
 
@@ -571,12 +619,14 @@ def toggle_daemon():
 RESENDABLE_STATES = ("published", "active")
 
 def resend_blocked_reason(state):
+    """Why a task's own state rules out a re-send. Phrased to follow "N tasks skipped — "."""
     if state in CLOSED_STATES:
-        return "it is already %s" % STATE_LABEL.get(state, state)
-    return "the Target already delivered it, so the next move is the Source's"
+        return "already %s" % STATE_LABEL.get(state, state)
+    return "the Source has it now"
 
-def resend_tasks(ids, statuses):
+def resend_tasks(ids, statuses, tabs=None):
     """Re-deliver each task's prompt, but only to a Target that is ready for input."""
+    if tabs is None: tabs = pane_tabs()
     c = conn()
     try: rows = [c.execute("select * from tasks where id=?", (tid,)).fetchone() for tid in ids]
     finally: c.close()
@@ -584,16 +634,37 @@ def resend_tasks(ids, statuses):
     for row in rows:
         if not row: continue
         if row["state"] not in RESENDABLE_STATES:      # only the Target's own outstanding work
-            skipped.append("%s cannot be re-sent — %s"
-                           % (row["id"], resend_blocked_reason(row["state"])))
+            skipped.append((resend_blocked_reason(row["state"]), None))   # counted, not named
             continue
         entry = _lookup_status(statuses, row["target_agent"], row["target_pane"])
-        who = live_label(entry, row["target_agent"])   # the pane may hold a renamed agent
+        who = live_label(entry, row["target_agent"], row["target_pane"], None)
         if entry is None or entry[0] not in READY_STATUSES:
-            skipped.append("%s skipped — %s" % (who, not_ready_reason(entry))); continue
-        if prompt(who, task_text(row, resend=True)) is None: failed.append(who)  # a stale name won't resolve
+            skipped.append((not_ready_reason(entry), who)); continue
+        # Address the pane's current occupant by its live name, or the raw pane id. Never the
+        # display label: that may be a shortened pane reference herdr cannot resolve.
+        target = (entry[1] if entry[1] else None) or row["target_pane"] or row["target_agent"]
+        if prompt(target, task_text(row, resend=True)) is None: failed.append(who)
         else: sent.append(who)
     return sent, skipped, failed
+
+def resend_summary(sent, skipped, failed):
+    """One line describing what a re-send did, in counts rather than task ids.
+
+    An id would be the longest thing on the line and says nothing the board above does not
+    already show. How many were left alone, and why, is what the message is for.
+    """
+    parts = []
+    if sent:
+        parts.append("Re-sent %d task%s to %s"
+                     % (len(sent), "" if len(sent) == 1 else "s", ", ".join(sorted(sent))))
+    counts = {}
+    for reason, who in skipped:
+        if who is None: counts[reason] = counts.get(reason, 0) + 1     # count task-level reasons
+        else: parts.append("%s skipped — %s" % (who, reason))          # agent-level ones name the agent
+    for reason, n in counts.items():
+        parts.append("%d task%s skipped — %s" % (n, "" if n == 1 else "s", reason))
+    for name in failed: parts.append("Could not reach %s" % name)
+    return " · ".join(parts) or "No task was re-sent"
 
 def ui(_):
     if not sys.stdout.isatty():
@@ -602,7 +673,7 @@ def ui(_):
     fd = sys.stdin.fileno(); saved = termios.tcgetattr(fd)
     selected, cursor = set(), 0
     mode, pending, flash = None, [], None
-    statuses, last_status = {}, 0.0
+    statuses, tabs, last_status = {}, {}, 0.0
     try:
         attr = termios.tcgetattr(fd)
         attr[3] &= ~(termios.ICANON | termios.ECHO)   # cbreak; keep ISIG so Ctrl-C still works
@@ -611,19 +682,20 @@ def ui(_):
         while True:
             size = shutil.get_terminal_size((110, 30)); width = size.columns
             if time.time() - last_status >= STATUS_TTL:
-                statuses = agent_statuses(max_age=0); last_status = time.time()
+                statuses = agent_statuses(max_age=0); tabs = pane_tabs(max_age=0)
+                last_status = time.time()
             items = board_items()
             if selected: selected &= {i["id"] for i in items}   # drop ids that vanished
             cursor = max(0, min(cursor, len(items)-1)) if items else 0
             if flash and time.time() > flash[1]: flash = None
             if mode == "confirm_delete":
-                message = ("Delete %d task%s — %s?   y = yes, any other key = no"
-                           % (len(pending), "" if len(pending) == 1 else "s", ", ".join(pending)),
-                           ("red",))
+                message = ("Delete %d selected task%s?   [y/N]"
+                           % (len(pending), "" if len(pending) == 1 else "s"), ("red",))
             elif flash: message = (flash[0], ("yellow",))
             else: message = None
-            sys.stdout.write("\033[H" + render_board(width, selected, cursor, statuses, items,
-                                                     message, height=size.lines) + "\033[J")
+            frame = render_board(width, selected, cursor, statuses, items,
+                                 message, height=size.lines, tabs=tabs)
+            sys.stdout.write(frame_bytes(frame))
             sys.stdout.flush()
 
             key = _read_key(1.0)
@@ -655,11 +727,7 @@ def ui(_):
                 if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else:
                     sent, skipped, failed = resend_tasks(sorted(selected), statuses)
-                    parts = []
-                    if sent: parts.append("Re-sent to " + ", ".join(sent))
-                    parts += skipped                      # each is already a full clause
-                    for name in failed: parts.append("Could not reach %s" % name)
-                    flash = (" · ".join(parts) or "No task was re-sent", time.time()+5)
+                    flash = (resend_summary(sent, skipped, failed), time.time()+5)
             elif key == "d":
                 if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else: pending, mode = sorted(selected), "confirm_delete"
@@ -674,14 +742,14 @@ def ui(_):
 def build_parser():
     """Exposed so tests can check that a generated command is one the CLI actually accepts."""
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
-    s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-tab",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-tab",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
+    s=sp.add_parser("send"); s.add_argument("--source-pane",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
     for n in ("take","progress","claim","accept","reject","blocked","reply","cancel","done-implicit"):
         x=sp.add_parser(n); x.add_argument("id"); x.add_argument("--reason", "--description", dest="reason", default=""); x.add_argument("--result-file"); x.set_defaults(fn=cmd_action,cmd=n)
         if n in ("take", "claim", "accept", "done-implicit"):
-            x.add_argument("--agent-name", required=True); x.add_argument("--tab", required=True); x.add_argument("--pane", required=True)
+            x.add_argument("--pane", required=True)
     sp_reply = sp.choices["reply"]; sp_reply.add_argument("--message", required=True)
     x=sp.add_parser("delete"); x.add_argument("id", nargs="?"); x.add_argument("--state"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_action,cmd="delete")
-    d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.add_argument("--agent-name",required=True); d.add_argument("--tab",required=True); d.add_argument("--pane",required=True); d.set_defaults(fn=cmd_action,cmd="done")
+    d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.add_argument("--pane",required=True); d.set_defaults(fn=cmd_action,cmd="done")
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)
     d=sp.add_parser("daemon"); d.add_argument("op",choices=("start","stop","status")); d.set_defaults(fn=daemon)
     u=sp.add_parser("ui"); u.set_defaults(fn=ui)

@@ -10,8 +10,8 @@ cd Skills/handoff
 handoff --help
 
 ./handoff daemon start
-./handoff send --source-agent A --source-pane w1:p1 \
-  --target-agent B --target-pane w1:p4 \
+./handoff send --source-pane w1:p1 \
+  --target-pane w1:p4 \
   --description "修复 footer 窄屏重叠" --prompt "检查并修复布局"
 ./handoff ui
 ```
@@ -27,7 +27,7 @@ A 领取并验收：
 
 ```sh
 ./handoff claim <task-id>
-./handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
+./handoff claim <task-id> --pane <your-pane>
 ```
 
 删除任务及其已保存结果：

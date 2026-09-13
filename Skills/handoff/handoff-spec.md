@@ -173,7 +173,7 @@ Description: <description>
 Result file: <result-file>
 
 B 已提交任务结果。请检查结果后执行：
-handoff claim <task-id> --agent-name <your-agent> --tab <your-tab> --pane <your-pane>
+handoff claim <task-id> --pane <your-pane>
 
 `claim` 完成 Source 的检查并结束任务；需要修改时重新发布一个任务。
 ```
