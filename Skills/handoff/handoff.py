@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Small, dependency-free Herdr handoff coordinator."""
-import argparse, json, os, shutil, sqlite3, subprocess, sys, time, uuid
+import argparse, json, os, shutil, sqlite3, subprocess, sys, time, unicodedata, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -103,10 +103,165 @@ def daemon(a):
         for p in (ROOT/"daemon.pid",ROOT/"daemon.stop"):
             try:p.unlink()
             except:pass
+# ---------- board rendering ----------
+
+CLOSED_STATES = ("accepted","rejected","cancelled","stopped","timeout",
+                 "target_absent","source_absent")
+STATE_LABEL = {"published":"published","active":"active","result_ready":"result ready",
+               "reviewing":"reviewing","accepted":"accepted","rejected":"rejected",
+               "cancelled":"cancelled","stopped":"stopped","timeout":"timeout",
+               "target_absent":"target absent","source_absent":"source absent"}
+STATE_STYLE = {"published":("cyan",),"active":("cyan",),"result_ready":("boldblue",),
+               "reviewing":("boldyellow",),"accepted":("boldgreen",),"rejected":("boldred",),
+               "cancelled":("dim",),"stopped":("dim",),"timeout":("boldred",),
+               "target_absent":("boldred",),"source_absent":("boldred",)}
+ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",
+                "source_reply":"reply","none":"—"}
+_CODES = {"dim":"2","bold":"1","red":"31","green":"32","yellow":"33","blue":"34","cyan":"36",
+          "boldred":"1;31","boldgreen":"1;32","boldyellow":"1;33","boldblue":"1;34"}
+_ANSI_ON = False
+
+def _use_color():
+    global _ANSI_ON
+    _ANSI_ON = (sys.stdout.isatty() and os.environ.get("TERM","") not in ("","dumb")
+                and "NO_COLOR" not in os.environ)
+    return _ANSI_ON
+
+def _cw(ch):
+    """Terminal columns for one character. CJK counts as 2."""
+    return 2 if unicodedata.east_asian_width(ch) in ("W","F") else 1
+
+def _dw(s): return sum(_cw(ch) for ch in s)
+
+def _fit(s, width):
+    if width <= 0: return ""
+    if _dw(s) <= width: return s
+    if width == 1: return "…"
+    out, w = "", 0
+    for ch in s:
+        if w + _cw(ch) > width - 1: break
+        out += ch; w += _cw(ch)
+    return out + "…"
+
+def _pad(s, width, right=False):
+    gap = max(0, width - _dw(s))
+    return " "*gap + s if right else s + " "*gap
+
+def _paint(s, *styles):
+    flat = []
+    for st in styles: flat.extend(st if isinstance(st,(tuple,list)) else (st,))
+    if not flat or not _ANSI_ON: return s
+    return "".join("\033[%sm" % _CODES[x] for x in flat if x in _CODES) + s + "\033[0m"
+
+def _human_age(sec):
+    sec = max(0, int(sec))
+    if sec < 60: return "%ds" % sec
+    if sec < 3600: return "%dm" % (sec // 60)
+    if sec < 86400: return "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
+    return "%dd%02dh" % (sec // 86400, sec % 86400 // 3600)
+
+def render_board(width=100):
+    me = os.environ.get("HERDR_PANE_ID")
+    items = []
+    for r in conn().execute("select * from tasks order by state_since"):
+        action = r["action"]; to_target = action in ("take","done")
+        actor = r["target_agent"] if to_target else r["source_agent"]
+        actor_pane = r["target_pane"] if to_target else r["source_pane"]
+        items.append({
+            "id": r["id"], "desc": r["description"].replace("\n"," / "),
+            "route": "%s → %s" % (r["source_agent"], r["target_agent"]),
+            "state": r["state"], "action": action, "actor": actor,
+            "mine": (bool(me) and actor_pane == me and action != "none"
+                     and r["state"] not in CLOSED_STATES),
+            "closed": r["state"] in CLOSED_STATES,
+            "age": _human_age(time.time() - datetime.fromisoformat(r["state_since"]).timestamp()),
+            "since": r["state_since"],
+        })
+    # live tasks first, finished ones sink to the bottom
+    items.sort(key=lambda x: (x["closed"], x["since"]))
+
+    def next_cell(i):
+        if i["action"] == "none": return "—", ("dim",)
+        label = ACTION_LABEL.get(i["action"], i["action"])
+        if i["mine"]: return "▶ %s" % label, ("boldyellow",)
+        return "%s · %s" % (label, i["actor"]), ("dim",)
+
+    kid = max([_dw("ID")] + [_dw(i["id"]) for i in items])
+    kst = max([_dw("STATE")] + [_dw(STATE_LABEL.get(i["state"], i["state"])) for i in items])
+    kag = max([_dw("AGE")] + [_dw(i["age"]) for i in items])
+    krt = max([_dw("ROUTE")] + [_dw(i["route"]) for i in items])
+    knx = max([_dw("NEXT")] + [_dw(next_cell(i)[0]) for i in items])
+
+    show_route = show_next = True
+    MIN_DESC = 18
+    def fixed():
+        w = 1 + kid + kst + kag + 2*4
+        if show_route: w += krt + 2
+        if show_next: w += knx + 2
+        return w
+    while width - fixed() < MIN_DESC:
+        if show_route: show_route = False
+        elif show_next: show_next = False
+        else: break
+    desc_w = max(6, width - fixed())
+
+    def row(cells):
+        parts = []
+        for idx, (text, styles, w, align) in enumerate(cells):
+            parts.append(_paint(_pad(text, w, align == "r") if idx < len(cells)-1 else text, *styles))
+        return "  ".join(parts).rstrip()
+
+    def build(mark, _id, desc, route, state, nxt, age, ms, ds, ss, ns, as_):
+        cells = [(mark, ms, 1, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
+        if show_route: cells.append((route, ds, krt, "l"))
+        cells.append((state, ss, kst, "l"))
+        if show_next: cells.append((nxt, ns, knx, "l"))
+        cells.append((age, as_, kag, "r"))
+        return row(cells)
+
+    n = len(items)
+    awaiting = sum(1 for i in items if i["mine"] and not i["closed"])
+    left_plain = "Handoff · %d task%s" % (n, "" if n == 1 else "s")
+    left = _paint("Handoff", "bold") + _paint(" · %d task%s" % (n, "" if n == 1 else "s"), "dim")
+    if awaiting:
+        left_plain += " · %d awaiting you" % awaiting
+        left += _paint(" · %d awaiting you" % awaiting, "boldyellow")
+    clock = datetime.now().strftime("%H:%M:%S")
+    lines = [left + " " * max(1, width - _dw(left_plain) - len(clock)) + _paint(clock, "dim"),
+             _paint("─" * width, "dim")]
+
+    lines.append(build("", "ID", "DESCRIPTION", "ROUTE", "STATE", "NEXT", "AGE",
+                       ("dim",), ("dim",), ("dim",), ("dim",), ("dim",)))
+    if not items:
+        lines.append(_paint("  no tasks yet — handoff send ... to create one", ("dim",)))
+    for i in items:
+        ds = ("dim",) if i["closed"] else ()
+        nxt, ns = next_cell(i)
+        lines.append(build("▸" if i["mine"] else " ", i["id"], _fit(i["desc"], desc_w),
+                           i["route"], STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
+                           ("boldyellow",) if i["mine"] else ds,
+                           ds, STATE_STYLE.get(i["state"], ()), ns, ds))
+    lines.append("")
+    legend = ("▸ your turn   ·   " if awaiting else "") + "refresh 1s   ·   Ctrl-C to quit"
+    lines.append(_paint(legend, ("dim",)))
+    return "\n".join(lines)
+
 def ui(_):
-    while True:
-        os.system("clear"); print("TASK\tDESCRIPTION\tSOURCE\tTARGET\tSTATE\tACTION\tAGE")
-        cmd_list(None); time.sleep(2)
+    if not sys.stdout.isatty():
+        print(render_board(shutil.get_terminal_size((110, 30)).columns)); return
+    _use_color()
+    try:
+        sys.stdout.write("\033[?25l\033[H\033[2J")
+        while True:
+            frame = render_board(shutil.get_terminal_size((110, 30)).columns)
+            sys.stdout.write("\033[H" + frame + "\033[J")
+            sys.stdout.flush()
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
 def main():
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
     s=sp.add_parser("send"); s.add_argument("--source-agent",required=True); s.add_argument("--source-pane",required=True); s.add_argument("--target-agent",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
