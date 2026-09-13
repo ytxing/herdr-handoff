@@ -49,5 +49,10 @@ class HandoffCliTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description", result.stderr)
 
+    def test_delete_removes_task(self):
+        result = self.run_cli("delete", "t_test")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.handoff.conn().execute("select * from tasks where id='t_test'").fetchone())
+
 if __name__ == "__main__":
     unittest.main()

@@ -78,9 +78,11 @@ handoff request-changes <task-id> --description <text>
 handoff reject <task-id> --reason <text>
 handoff stop <task-id>
 handoff cancel <task-id>
+handoff delete <task-id>
 ```
 
 `progress` 不改变业务状态，只刷新执行计时。`reject` 只能由 Agent 明确执行，后台不能自行推断拒绝。`blocked` 保持任务为 `active`，并将 `required_action` 设为 `source_reply`；后台 Prompt Source 回复 B。
+`delete` 永久删除任务记录及其已保存的结果文件。
 
 ## 正常流程
 

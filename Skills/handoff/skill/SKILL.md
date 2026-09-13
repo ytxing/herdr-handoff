@@ -67,6 +67,9 @@ Inspect the saved result, then either accept or request changes:
 
 `claim` means received for review. `accept` is the final acceptance command and moves the task to `finished`.
 
+To remove a task and its saved result permanently, run `./handoff delete <task-id>` only
+when that deletion is intended.
+
 ## Daemon and board
 
 The daemon is manual; never assume it is running:
