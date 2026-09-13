@@ -38,6 +38,11 @@ When finished, write a readable result file and run:
 ./handoff done <task-id> --result-file <path>
 ```
 
+For a task with a handoff ID, do not use `herdr agent prompt` to return the result to
+Source. `handoff done` is the only return path; the handoff service saves the result and
+notifies Source. Direct Agent-to-Agent Herdr prompts bypass the task record and can cause
+duplicate or untracked delivery.
+
 If work began before `take`, use `--implicit-take` with `done`. Use `progress` only to
 reset the long execution timer. Use `reject` only when explicitly refusing the task;
 do not use it merely because a reminder arrived. Use `blocked` when Source must answer.
