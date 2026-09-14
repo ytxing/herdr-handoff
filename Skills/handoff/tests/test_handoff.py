@@ -7,8 +7,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-INSERT = ("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,"
-          "target_pane,state,action,state_since) values(?,?,?,?,?,?,?,?,?,?)")
+INSERT = ("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since)"
+          " values(?,?,?,?,?,?,?,?)")
 
 
 class HandoffTestBase(unittest.TestCase):
@@ -48,7 +48,7 @@ class HandoffCliTests(HandoffTestBase):
     def setUp(self):
         super().setUp()
         c = self.db()
-        c.execute(INSERT, ("t_test", "测试任务", "prompt", "A", "p1", "B", "p2",
+        c.execute(INSERT, ("t_test", "测试任务", "prompt", "wA:p1", "wA:p2",
                            "published", "take", self.handoff.now()))
         c.commit()
 
@@ -80,11 +80,11 @@ class HandoffCliTests(HandoffTestBase):
 class BoardRenderTests(HandoffTestBase):
     """The board is a pure function over an explicit task list, so it needs no terminal to test."""
 
-    ROWS = [("t_aaaa111122", "中文描述测试",         "prompt", "h1",      "wA:p2V", "h2",   "wA:p2W", "published", "take"),
-            ("t_bbbb333344", "an ascii description", "prompt", "t1-main", "wA:pH",  "gone", "wA:pZZ", "active",    "done"),
-            ("t_cccc555566", "短",                   "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "finished",  "none"),
+    ROWS = [("t_aaaa111122", "中文描述测试",         "prompt", "wA:p2V", "wA:p2W", "published", "take"),
+            ("t_bbbb333344", "an ascii description", "prompt", "wA:pH",  "wA:pZZ", "active",    "done"),
+            ("t_cccc555566", "短",                   "prompt", "wA:p2W", "wA:p2V", "finished",  "none"),
             # live task whose Target is busy, so the resend gate on agent status gets exercised
-            ("t_dddd777777", "目标在忙",              "prompt", "h2",      "wA:p2W", "h1",   "wA:p2V", "active",    "done")]
+            ("t_dddd777777", "目标在忙",              "prompt", "wA:p2W", "wA:p2V", "active",    "done")]
 
     def setUp(self):
         super().setUp()
@@ -155,7 +155,7 @@ class BoardRenderTests(HandoffTestBase):
     def seed_many(self, count=20):
         c = self.db()
         for k in range(count):
-            c.execute(INSERT, ("t_many%06d" % k, "任务%d" % k, "prompt", "h1", "wA:p2V", "h2", "wA:p2W",
+            c.execute(INSERT, ("t_many%06d" % k, "任务%d" % k, "prompt", "wA:p2V", "wA:p2W",
                                "finished", "none", self.handoff.now()))
         c.commit()
         return self.handoff.board_items()
@@ -439,7 +439,7 @@ class BoardRenderTests(HandoffTestBase):
         self.handoff.prompt = lambda agent, text: (sent.append(agent), {"ok": 1})[1]
         c = self.db()
         # renamed Target: stored name is stale, the pane holds an unnamed live agent
-        c.execute("update tasks set target_agent='old-name', target_pane='wA:p2Y'"
+        c.execute("update tasks set target_pane='wA:p2Y'"
                   " where id='t_aaaa111122'")
         c.commit()
         statuses = {"wA:p2Y": ("idle", None)}

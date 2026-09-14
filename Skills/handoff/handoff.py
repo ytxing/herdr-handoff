@@ -20,8 +20,7 @@ def conn():
     c=sqlite3.connect(DB); c.row_factory=sqlite3.Row
     c.execute("""create table if not exists tasks(
       id text primary key, description text not null, prompt text not null,
-      source_agent text not null, source_pane text not null, target_agent text not null,
-      target_pane text not null, state text not null, action text not null,
+      source_pane text not null, target_pane text not null, state text not null, action text not null,
       state_since text not null, last_prompt_at text, next_prompt_at text,
       retry_count integer not null default 0, result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
@@ -116,11 +115,10 @@ def cmd_send(a):
     # Explicit source and target are required; validate when Herdr is available.
     if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
     if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")
-    c.execute("insert into tasks(id,description,prompt,source_agent,source_pane,target_agent,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-      (tid,a.description,a.prompt,"",a.source_pane,"",a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
+    c.execute("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?)",
+      (tid,a.description,a.prompt,a.source_pane,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
     row = {"id":tid, "description":a.description, "prompt":a.prompt,
-           "source_agent":"", "source_pane":a.source_pane,
-           "target_agent":"", "target_pane":a.target_pane}
+           "source_pane":a.source_pane, "target_pane":a.target_pane}
     if prompt(a.target_pane, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
     print(tid)
 
@@ -163,7 +161,7 @@ def cmd_action(a):
 def cmd_list(_):
     for r in conn().execute("select * from tasks order by state_since"):
         age=int(time.time()-datetime.fromisoformat(r["state_since"]).timestamp())
-        print(f"{r['id']}\t{r['description'].replace(chr(10),' / ')}\t{r['source_agent']}/{r['source_pane']}\t{r['target_agent']}/{r['target_pane']}\t{r['state']}\t{r['action']}\t{age}s")
+        print(f"{r['id']}\t{r['description'].replace(chr(10),' / ')}\t{r['source_pane']} → {r['target_pane']}\t{r['state']}\t{r['action']}\t{age}s")
 def daemon(a):
     if a.op=="status": print("running" if (ROOT/"daemon.pid").exists() else "stopped"); return
     if a.op=="stop":
@@ -184,8 +182,9 @@ def daemon(a):
                     result = info.get("result", info) if isinstance(info,dict) else {}
                     agent_info = result.get("agent", result) if isinstance(result,dict) else {}
                     lifecycle = agent_info.get("agent_status", agent_info.get("status", "unknown")) if isinstance(agent_info,dict) else "unknown"
-                c.execute(f"update tasks set {'target' if ag==r['target_agent'] else 'source'}_lifecycle=?, {'target' if ag==r['target_agent'] else 'source'}_presence=? where id=?",(lifecycle,present,r['id'])); c.commit()
-                if present=="absent": transition(c,r["id"],"target_absent" if ag==r["target_agent"] else "source_absent","none",error="Herdr Agent absent"); continue
+                side = "target" if ag == r["target_pane"] else "source"
+                c.execute(f"update tasks set {side}_lifecycle=?, {side}_presence=? where id=?",(lifecycle,present,r['id'])); c.commit()
+                if present=="absent": transition(c,r["id"],"target_absent" if side == "target" else "source_absent","none",error="Herdr Agent absent"); continue
                 if lifecycle=="working":
                     # Herdr owns the wait; this time is outside task backoff.
                     waited = herdr("agent","wait",ag,"--until","idle", timeout=None)
@@ -376,13 +375,13 @@ def board_items():
     items = []
     for r in rows:
         action = r["action"]; to_target = action in ("take","done")
-        actor = r["target_agent"] if to_target else r["source_agent"]
+        actor = r["target_pane"] if to_target else r["source_pane"]
         actor_pane = r["target_pane"] if to_target else r["source_pane"]
         items.append({
             "id": r["id"], "desc": r["description"].replace("\n"," / "),
-            "src_agent": r["source_agent"], "src_pane": r["source_pane"],
-            "dst_agent": r["target_agent"], "dst_pane": r["target_pane"],
-            "route": "%s → %s" % (r["source_agent"], r["target_agent"]),
+            "src_agent": "", "src_pane": r["source_pane"],
+            "dst_agent": "", "dst_pane": r["target_pane"],
+            "route": "%s → %s" % (r["source_pane"], r["target_pane"]),
             "state": r["state"], "action": action, "actor": actor,
             "mine": (bool(me) and actor_pane == me and action != "none"
                      and r["state"] not in CLOSED_STATES),
@@ -636,13 +635,13 @@ def resend_tasks(ids, statuses, tabs=None):
         if row["state"] not in RESENDABLE_STATES:      # only the Target's own outstanding work
             skipped.append((resend_blocked_reason(row["state"]), None))   # counted, not named
             continue
-        entry = _lookup_status(statuses, row["target_agent"], row["target_pane"])
-        who = live_label(entry, row["target_agent"], row["target_pane"], None)
+        entry = _lookup_status(statuses, None, row["target_pane"])
+        who = live_label(entry, None, row["target_pane"], None)
         if entry is None or entry[0] not in READY_STATUSES:
             skipped.append((not_ready_reason(entry), who)); continue
         # Address the pane's current occupant by its live name, or the raw pane id. Never the
         # display label: that may be a shortened pane reference herdr cannot resolve.
-        target = (entry[1] if entry[1] else None) or row["target_pane"] or row["target_agent"]
+        target = (entry[1] if entry[1] else None) or row["target_pane"]
         if prompt(target, task_text(row, resend=True)) is None: failed.append(who)
         else: sent.append(who)
     return sent, skipped, failed
