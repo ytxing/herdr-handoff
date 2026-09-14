@@ -1,6 +1,7 @@
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -123,6 +124,27 @@ class HandoffCliTests(HandoffTestBase):
         other = self.run_cli("send", "--source-pane", "wA:pTEST-SRC", "--target-pane", "wA:pTEST-B",
                              "--description", "d", "--prompt", "p")
         self.assertEqual(other.returncode, 0, other.stderr)
+
+    def test_the_store_rejects_a_second_open_task_for_one_target(self):
+        """The SELECT in send() cannot serialise two concurrent sends; the store must.
+
+        Both can read "nothing open" before either inserts, so the constraint has to live where
+        the write does. Bypassing the check here stands in for that interleaving.
+        """
+        c = self.db()
+        def insert(tid, state):
+            c.execute(INSERT, (tid, "并发", "p", "wA:pTEST-SRC", "wA:pTEST-SAME",
+                               state, "take", self.handoff.now()))
+            c.commit()
+        insert("t_open0", "published")
+        with self.assertRaises(sqlite3.IntegrityError,
+                               msg="the store must reject a second open task for one Target"):
+            insert("t_open1", "active")
+        self.assertEqual(
+            c.execute("select count(*) from tasks where target_pane='wA:pTEST-SAME'").fetchone()[0], 1)
+        # a terminal state frees the Target again, which is what the partial index says
+        c.execute("update tasks set state='finished' where id='t_open0'"); c.commit()
+        insert("t_open_again", "published")
 
     def test_an_error_payload_is_not_mistaken_for_a_result(self):
         """herdr puts failures on stdout as {"error": ...} with a non-zero exit.
@@ -561,8 +583,7 @@ class BoardRenderTests(HandoffTestBase):
         c.execute("update tasks set state='finished', action='none' where id='t_cccc555566'")
         c.commit()
         ident = ("--pane", "wA:pTEST-DST")
-        cases = [("take", ident), ("progress", ()), ("reply", ("--message", "x")),
-                 ("reject", ("--reason", "no")), ("blocked", ("--reason", "stuck"))]
+        cases = [("take", ident), ("progress", ()), ("reject", ("--reason", "no"))]
         for command, extra in cases:
             result = self.run_cli(command, "t_cccc555566", *extra)
             self.assertNotEqual(result.returncode, 0, "%s on a closed task must be refused" % command)
@@ -620,7 +641,7 @@ class BoardRenderTests(HandoffTestBase):
         filled = {"<your-agent>": "a", "<your-tab>": "t", "<your-pane>": "p",
                   "<path>": "/tmp/result.md", '"<your answer>"': "yes"}
         parser = self.handoff.build_parser()
-        for action in ("take", "done", "claim", "accept", "reply"):
+        for action in ("take", "done", "claim", "accept"):
             text = self.handoff.reminder_text({"id": "t_x", "description": "d"}, action)
             self.assertIn(self.handoff.REMINDER_WHY[action], text, "the reminder must say why")
             command = text.split("Run:\n", 1)[1].strip()

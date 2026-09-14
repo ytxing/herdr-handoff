@@ -61,9 +61,13 @@ notifies Source. Direct Agent-to-Agent Herdr prompts bypass the task record and 
 duplicate or untracked delivery.
 
 If work began before `take`, use `--implicit-take` with `done`. Use `progress` only to
-reset the long execution timer. Use `reject` only when explicitly refusing the task;
-do not use it merely because a reminder arrived. Use `blocked` when Source must answer.
-When Source answers a blocked task, run `reply <task-id> --message "<answer>"`.
+reset the long execution timer. Use `reject` only when explicitly refusing the task; do not
+use it merely because a reminder arrived.
+
+A task that needs an answer from Source is not a separate protocol state: submit what you
+have with `done` and put the question in the result file. Source reads it and sends a
+follow-up task. There is no blocked/reply round trip, so `active` always means exactly one
+thing -- the Target has taken the task and is working on it.
 
 ## Source review
 
@@ -155,8 +159,7 @@ the Target and send a new task; the service does not migrate it automatically.
 
 A command that would move a closed task (`finished`, `rejected`, `cancelled`, `timeout`,
 `*_absent`) back into the live set is refused, with a non-zero exit and a message naming the
-current state. This covers `take`, `progress`, `done`, `done-implicit`, `reply`, `blocked` and
-`reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
+current state. This covers `take`, `progress`, `done`, `done-implicit` and `reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
 to `active`, redo the work, overwrite the saved result and notify the Source a second time.
 
 `claim` is deliberately idempotent: it lands on `finished`, so re-running it is a

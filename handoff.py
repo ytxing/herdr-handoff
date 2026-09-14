@@ -27,6 +27,12 @@ def conn():
       retry_count integer not null default 0, result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
       source_presence text, target_presence text)""")
+    # One open task per Target, enforced by the store rather than by a check that a concurrent
+    # send can race past: two sends could both SELECT, both see nothing, and both INSERT.
+    # A partial index makes the second insert fail instead of succeeding quietly.
+    c.execute("""create unique index if not exists one_open_task_per_target
+                 on tasks(target_pane) where state not in
+                 ('finished','rejected','cancelled','timeout','target_absent','source_absent')""")
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
     c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
@@ -93,14 +99,12 @@ REMINDER_COMMAND = {
     "done":   "python3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS,
     "claim":  "python3 {cli} claim {id} " + IDENTITY_ARGS,
     "accept": "python3 {cli} accept {id} " + IDENTITY_ARGS,
-    "reply":  'python3 {cli} reply {id} --message "<your answer>"',
 }
 REMINDER_WHY = {
     "take":   "This task is waiting for you to accept it.",
     "done":   "You accepted this task but have not submitted a result yet.",
     "claim":  "A result has been submitted and is waiting for you to look at it.",
     "accept": "You reviewed a result but have not marked the task finished yet.",
-    "reply":  "This task is blocked on a question that only you can answer.",
 }
 # The pane that owns each pending action.  There is deliberately no fallback:
 # an unknown/non-action marker must never be turned into a reminder for Source.
@@ -109,13 +113,12 @@ REMINDER_RECIPIENT = {
     "done": "target",
     "claim": "source",
     "accept": "source",
-    "reply": "source",
 }
 
 def reminder_text(row, action):
     """The nudge the daemon sends: says why, and gives the exact command for that action.
 
-    A generic `handoff {action} {id}` is not enough -- `reply` needs `--message`, so the
+    A generic `handoff {action} {id}` is not enough -- `done` needs `--result-file`, so the
     agent would be handed a command that argparse rejects.
     """
     command = REMINDER_COMMAND.get(action, "python3 {cli} {action} {id}").format(
@@ -137,8 +140,15 @@ def cmd_send(a):
     # Explicit source and target are required; validate when Herdr is available.
     if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
     if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")
-    c.execute("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?)",
-      (tid,a.description,a.prompt,a.source_pane,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present")); c.commit()
+    try:
+        c.execute("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?)",
+          (tid,a.description,a.prompt,a.source_pane,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present"))
+        c.commit()
+    except sqlite3.IntegrityError:
+        # The partial unique index turned the check above into something a concurrent send
+        # cannot race past. This is the authoritative guard; the SELECT only gives a nicer
+        # message in the common single-sender case.
+        raise SystemExit("this target already has an unfinished task")
     row = {"id":tid, "description":a.description, "prompt":a.prompt,
            "source_pane":a.source_pane, "target_pane":a.target_pane}
     if prompt(a.target_pane, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
@@ -165,8 +175,6 @@ def cmd_action(a):
         prompt(row["source_pane"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --pane <your-pane>")
     elif a.cmd in ("claim", "accept"): transition(c,a.id,"finished","none",a.cmd)
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
-    elif a.cmd=="blocked": transition(c,a.id,"active","reply","blocked",a.reason)
-    elif a.cmd=="reply": transition(c,a.id,"active","done","reply",a.message)
     elif a.cmd=="cancel": transition(c,a.id,"cancelled","none","cancel")
     elif a.cmd=="delete":
         if a.id: ids = [r["id"] for r in c.execute("select id from tasks where id=?", (a.id,))]
@@ -286,7 +294,7 @@ CLOSED_STATES = ("finished","rejected","cancelled","timeout",
                  "target_absent","source_absent")
 # Commands that would move a closed task back into the live set. `claim`/`accept` are absent on
 # purpose: they land on `finished`, so re-running one is a harmless retry, not a resurrection.
-RESURRECTING_COMMANDS = ("take","progress","done","done-implicit","reply","blocked","reject")
+RESURRECTING_COMMANDS = ("take","progress","done","done-implicit","reject")
 # The board prints the state name verbatim: it is the same word `handoff delete --state <name>`
 # takes, and six of the seven states were already shown untranslated -- only `result_ready` was
 # being prettified, which made the one that differed the hardest to match against a command.
@@ -294,8 +302,7 @@ STATE_STYLE = {"published":("blue",),"active":("cyan",),"result_ready":("magenta
                "finished":("green",),"rejected":("red",),
                "cancelled":("dim",),"timeout":("red",),
                "target_absent":("red",),"source_absent":("red",)}
-ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept",
-                "reply":"reply","source_reply":"reply","none":"—"}
+ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept","none":"—"}
 # No bold anywhere: weight is carried by colour alone. The bold codes are deliberately
 # absent from this table so a stray `("boldred",)` fails to render instead of creeping back.
 _CODES = {"dim":"2","red":"31","green":"32","yellow":"33","blue":"34","magenta":"35","cyan":"36"}
@@ -914,11 +921,10 @@ def build_parser():
     """Exposed so tests can check that a generated command is one the CLI actually accepts."""
     p=argparse.ArgumentParser(); sp=p.add_subparsers(dest="op",required=True)
     s=sp.add_parser("send"); s.add_argument("--source-pane",required=True); s.add_argument("--target-pane",required=True); s.add_argument("--description",required=True); s.add_argument("--prompt",required=True); s.set_defaults(fn=cmd_send)
-    for n in ("take","progress","claim","accept","reject","blocked","reply","cancel","done-implicit"):
+    for n in ("take","progress","claim","accept","reject","cancel","done-implicit"):
         x=sp.add_parser(n); x.add_argument("id"); x.add_argument("--reason", "--description", dest="reason", default=""); x.add_argument("--result-file"); x.set_defaults(fn=cmd_action,cmd=n)
         if n in ("take", "claim", "accept", "done-implicit"):
             x.add_argument("--pane", required=True)
-    sp_reply = sp.choices["reply"]; sp_reply.add_argument("--message", required=True)
     x=sp.add_parser("delete"); x.add_argument("id", nargs="?"); x.add_argument("--state"); x.add_argument("--all", action="store_true"); x.set_defaults(fn=cmd_action,cmd="delete")
     d=sp.add_parser("done"); d.add_argument("id"); d.add_argument("--result-file",required=True); d.add_argument("--implicit-take",action="store_true"); d.add_argument("--pane",required=True); d.set_defaults(fn=cmd_action,cmd="done")
     l=sp.add_parser("list"); l.set_defaults(fn=cmd_list)
