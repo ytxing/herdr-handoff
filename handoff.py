@@ -176,6 +176,12 @@ def daemon(a):
         while not (ROOT/"daemon.stop").exists():
             c=conn()
             for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
+                # `none` is a terminal/non-action marker.  It can be written when a
+                # target/source disappears or after a task is completed.  Never turn
+                # it into a source reminder: doing so used to send `none <task-id>`
+                # to the wrong pane.
+                if r["action"] == "none" or r["state"] in ("target_absent", "source_absent"):
+                    continue
                 ag=r["target_pane"] if r["action"] in ("take","done") else r["source_pane"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
@@ -196,6 +202,8 @@ def daemon(a):
                 # command after `done`, `claim`, or another transition.
                 fresh = c.execute("select * from tasks where id=?", (r["id"],)).fetchone()
                 if not fresh or fresh["state"] in ("finished", "rejected", "cancelled", "timeout"):
+                    continue
+                if fresh["action"] == "none" or fresh["state"] in ("target_absent", "source_absent"):
                     continue
                 if fresh["state"] != r["state"] or fresh["action"] != r["action"]:
                     continue
