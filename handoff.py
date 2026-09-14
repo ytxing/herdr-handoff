@@ -577,6 +577,21 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
 
 # ---------- interactive board ----------
 
+def terminal_size(fallback=(110, 30)):
+    """The terminal's real size, asked of the tty itself.
+
+    Deliberately not shutil.get_terminal_size(): that prefers $COLUMNS and $LINES, which go
+    stale the moment a pane is split or resized. Measured in a pty sized 80x20 with a leftover
+    COLUMNS=200, the ioctl reports 80 columns while shutil reports 200 -- so the board rendered
+    wider than its pane and the right-hand columns were clipped, AGE reading as "AG" and the
+    clock losing its last digit.
+    """
+    try:
+        size = os.get_terminal_size(sys.stdout.fileno())
+        return size.columns, size.lines
+    except (OSError, ValueError):
+        return fallback
+
 def frame_bytes(frame):
     """Encode a frame for the terminal, erasing each line's tail as it is written.
 
@@ -669,7 +684,7 @@ def resend_summary(sent, skipped, failed):
 
 def ui(_):
     if not sys.stdout.isatty():
-        print(render_board(shutil.get_terminal_size((110, 30)).columns)); return
+        print(render_board(terminal_size()[0])); return
     _use_color()
     fd = sys.stdin.fileno(); saved = termios.tcgetattr(fd)
     selected, cursor = set(), 0
@@ -681,7 +696,7 @@ def ui(_):
         termios.tcsetattr(fd, termios.TCSADRAIN, attr)
         sys.stdout.write("\033[?25l\033[H\033[2J")
         while True:
-            size = shutil.get_terminal_size((110, 30)); width = size.columns
+            width, height = terminal_size()
             if time.time() - last_status >= STATUS_TTL:
                 statuses = agent_statuses(max_age=0); tabs = pane_tabs(max_age=0)
                 last_status = time.time()
@@ -695,7 +710,7 @@ def ui(_):
             elif flash: message = (flash[0], ("yellow",))
             else: message = None
             frame = render_board(width, selected, cursor, statuses, items,
-                                 message, height=size.lines, tabs=tabs)
+                                 message, height=height, tabs=tabs)
             sys.stdout.write(frame_bytes(frame))
             sys.stdout.flush()
 
