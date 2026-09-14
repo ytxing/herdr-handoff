@@ -191,6 +191,14 @@ def daemon(a):
                     if waited is None:
                         c.execute("update tasks set error=? where id=?", ("Herdr agent wait failed", r['id'])); c.commit()
                         continue
+                # The agent may have completed the action while the status query or wait was
+                # in progress. Re-read before prompting so a stale row cannot send the old
+                # command after `done`, `claim`, or another transition.
+                fresh = c.execute("select * from tasks where id=?", (r["id"],)).fetchone()
+                if not fresh or fresh["state"] in ("finished", "rejected", "cancelled", "timeout"):
+                    continue
+                if fresh["state"] != r["state"] or fresh["action"] != r["action"]:
+                    continue
                 if time.time() >= datetime.fromisoformat((r["next_prompt_at"] or now())).timestamp():
                     retries = r["retry_count"]
                     protocol = r["state"] in ("published", "result_ready")
