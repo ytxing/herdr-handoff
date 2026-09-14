@@ -16,8 +16,9 @@ which is still safe.
 import json
 import os
 import sys
+import time
 
-AGENT = {"agent": "claude", "agent_status": "idle", "pane_id": "wA:pTEST",
+AGENT = {"agent": "claude", "agent_status": os.environ.get("FAKE_HERDR_STATUS", "idle"), "pane_id": "wA:pTEST",
          "tab_id": "wA:tTEST", "workspace_id": "wA", "terminal_id": "term_test",
          "name": "test-agent", "revision": 1, "state_change_seq": 1, "focused": False,
          "interactive_ready": True}
@@ -52,6 +53,18 @@ def main(argv):
         return 0
 
     if cmd[:2] == ["agent", "wait"]:
+        # Mirrors the real CLI: honour --timeout, and fail when the agent stays busy past it.
+        # FAKE_HERDR_WAIT_S makes an agent look permanently busy, which is the state that used
+        # to park the daemon and make `stop` report a failure that was not real.
+        busy = float(os.environ.get("FAKE_HERDR_WAIT_S", "0") or 0)
+        budget = None
+        if "--timeout" in cmd:
+            budget = float(cmd[cmd.index("--timeout") + 1]) / 1000.0
+        nap = busy if budget is None else min(busy, budget)
+        if nap > 0: time.sleep(nap)
+        if budget is not None and busy > budget:
+            sys.stderr.write("fake_herdr: agent still busy\n")
+            return 1
         emit({"id": "cli:agent:wait", "result": {"type": "agent_wait"}})
         return 0
 

@@ -196,6 +196,58 @@ class DaemonLifecycleTests(HandoffTestBase):
         finally:
             q.kill()
 
+    def test_stop_works_while_the_daemon_waits_on_a_busy_agent(self):
+        """A review finding: an unbounded `herdr agent wait` parked the daemon.
+
+        It sat in the wait for as long as the agent stayed busy, so `stop` reported failure
+        while the daemon was merely waiting -- a false negative, not a lock misjudgement.
+        """
+        c = self.db()
+        c.execute(INSERT, ("t_busy", "等一个忙碌的 agent", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "published", "take", self.handoff.now()))
+        c.commit()
+        os.environ["FAKE_HERDR_STATUS"] = "working"      # the daemon will enter the wait
+        os.environ["FAKE_HERDR_WAIT_S"] = "30"
+        p = None
+        try:
+            p = self.start_daemon()
+            time.sleep(self.handoff.SWEEP_SECONDS + 2)   # let it get into the wait
+            result = self.run_cli("daemon", "stop")
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("daemon stopped", result.stdout)
+        finally:
+            os.environ.pop("FAKE_HERDR_STATUS", None)
+            os.environ.pop("FAKE_HERDR_WAIT_S", None)
+            if p: p.kill()
+
+    def test_a_stop_addressed_to_another_daemon_is_ignored(self):
+        """A review finding: `stop` used to be a broadcast.
+
+        If the addressed daemon exited and a replacement started before the request landed, the
+        bare stop file killed the replacement -- so `stop` followed by `start` silently ended up
+        as just `stop`.
+        """
+        p = self.start_daemon()
+        try:
+            (Path(self.tmp.name) / "daemon.stop").write_text("999999")   # some other daemon
+            time.sleep(self.handoff.SWEEP_SECONDS + 2)
+            self.assertTrue(self.handoff.daemon_running(),
+                            "a request addressed to a different daemon must be ignored")
+        finally:
+            p.kill()
+
+    def test_an_unaddressed_stop_file_still_stops(self):
+        """A plain `touch daemon.stop` means "whichever daemon is running" and must keep working."""
+        p = self.start_daemon()
+        try:
+            (Path(self.tmp.name) / "daemon.stop").touch()
+            for _ in range(60):
+                if not self.handoff.daemon_running(): break
+                time.sleep(0.1)
+            self.assertFalse(self.handoff.daemon_running())
+        finally:
+            p.kill()
+
     def test_stop_reports_whether_it_actually_stopped(self):
         self.assertEqual(self.run_cli("daemon", "stop").stdout.strip(), "no daemon is running")
         p = self.start_daemon()

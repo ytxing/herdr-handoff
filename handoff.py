@@ -13,6 +13,8 @@ EXECUTION_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_INITIA
 EXECUTION_BACKOFF_MAX = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_MAX", "28800"))
 REVIEW_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_INITIAL", "120"))
 REVIEW_BACKOFF_MAX = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_MAX", "28800"))
+SWEEP_SECONDS = 2
+AGENT_WAIT_SLICE_MS = 3000          # see the note on the agent wait inside daemon()
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def conn():
@@ -176,14 +178,19 @@ def daemon(a):
         print("running" if daemon_running() else "stopped"); return
     if a.op=="stop":
         if not daemon_running(): print("no daemon is running"); return
-        try: (ROOT/"daemon.stop").touch()
+        # Address the request. A bare stop file would also be honoured by whatever daemon is
+        # running by the time it lands, so a `stop` followed quickly by `start` could kill the
+        # replacement -- the request was aimed at the instance that had already exited.
+        try: target = (ROOT/"daemon.pid").read_text().strip()
+        except (FileNotFoundError, ValueError): target = ""      # unaddressed: any daemon
+        try: (ROOT/"daemon.stop").write_text(target)
         except OSError: raise SystemExit("could not write the stop file")
-        # The daemon notices on its next sweep, so report what actually happened rather than
-        # just that the request was filed. "stop" that quietly did nothing is its own bug.
-        for _ in range(60):
+        # Report what actually happened rather than that the request was filed. A sweep parked
+        # on a busy agent can take a slice plus a sleep to come round, so the budget covers that.
+        for _ in range(150):
             if not daemon_running(): print("daemon stopped"); return
             time.sleep(0.1)
-        raise SystemExit("the daemon did not stop within 6 seconds")
+        raise SystemExit("the daemon did not stop within 15 seconds")
     lock = daemon_lock(retries=3)
     if lock is None:
         raise SystemExit("a daemon is already running")   # its pid is in daemon.pid
@@ -193,7 +200,7 @@ def daemon(a):
         try: (ROOT/"daemon.stop").unlink()
         except FileNotFoundError: pass
         (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
-        while not (ROOT/"daemon.stop").exists():
+        while not stop_requested():
             c=conn()
             for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
                 # `none` is a terminal/non-action marker.  It can be written when a
@@ -213,11 +220,12 @@ def daemon(a):
                 c.execute(f"update tasks set {side}_lifecycle=?, {side}_presence=? where id=?",(lifecycle,present,r['id'])); c.commit()
                 if present=="absent": transition(c,r["id"],"target_absent" if side == "target" else "source_absent","none",error="Herdr Agent absent"); continue
                 if lifecycle=="working":
-                    # Herdr owns the wait; this time is outside task backoff.
-                    waited = herdr("agent","wait",ag,"--until","idle", timeout=None)
-                    if waited is None:
-                        c.execute("update tasks set error=? where id=?", ("Herdr agent wait failed", r['id'])); c.commit()
-                        continue
+                    # Herdr owns the wait and it stays outside the task backoff, but the wait is
+                    # bounded. Waiting indefinitely parked the daemon for as long as an agent
+                    # stayed busy, so `stop` reported failure while it was simply waiting.
+                    if herdr("agent","wait",ag,"--until","idle",
+                             "--timeout",str(AGENT_WAIT_SLICE_MS), timeout=30) is None:
+                        continue      # still working; the next sweep re-checks the stop file
                 # The agent may have completed the action while the status query or wait was
                 # in progress. Re-read before prompting so a stale row cannot send the old
                 # command after `done`, `claim`, or another transition.
@@ -241,7 +249,7 @@ def daemon(a):
                     else:
                         delay = min(EXECUTION_BACKOFF_MAX, EXECUTION_BACKOFF_INITIAL * (2 ** retries))
                     c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+delay,timezone.utc).isoformat(),r['id'])); c.commit()
-            time.sleep(5)
+            time.sleep(SWEEP_SECONDS)
     finally:
         # Only remove the pid file if it still names this process. Deleting it blind let a
         # daemon that was exiting erase the record belonging to whoever holds the daemon role
@@ -250,8 +258,8 @@ def daemon(a):
             if (ROOT/"daemon.pid").read_text().strip() == str(os.getpid()):
                 (ROOT/"daemon.pid").unlink()
         except (FileNotFoundError, ValueError): pass
-        try: (ROOT/"daemon.stop").unlink()
-        except FileNotFoundError: pass
+        # The stop file is deliberately left alone. `daemon start` clears it once it holds the
+        # lock, and an exiting daemon removing it could delete a request aimed at its successor.
         lock.close()               # releases the flock; the kernel would do it anyway
 # ---------- board rendering ----------
 
@@ -402,6 +410,17 @@ def not_ready_reason(entry):
     if entry is None: return "it is no longer in Herdr"
     return NOT_READY_REASON.get(entry[0], "it is %s" % entry[0])
 
+def stop_requested():
+    """Whether a stop request is addressed to this process.
+
+    A bare stop file (empty, as plain `touch` writes it) means "whichever daemon is running",
+    which keeps a hand-issued `touch daemon.stop` working. `daemon stop` writes the pid it
+    means, so a request aimed at a daemon that has already exited cannot land on its successor.
+    """
+    try: target = (ROOT/"daemon.stop").read_text().strip()
+    except FileNotFoundError: return False
+    return target in ("", str(os.getpid()))
+
 def daemon_lock(retries=0):
     """Take the exclusive lock that makes a second daemon impossible.
 
@@ -418,9 +437,11 @@ def daemon_lock(retries=0):
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fh
-        except OSError:
+        except BlockingIOError:
             fh.close()
             if attempt < retries: time.sleep(0.1)   # the board probes this lock every second
+        except OSError:
+            fh.close(); raise       # a real IO error must not masquerade as "already running"
     return None
 
 def daemon_running():
@@ -686,11 +707,13 @@ def _read_key(timeout):
     return {b"A":"UP", b"B":"DOWN", b"C":"RIGHT", b"D":"LEFT"}.get(os.read(fd, 1))
 
 def toggle_daemon():
-    """The daemon is a foreground process, so start it detached; stop just drops the stop file."""
+    """The daemon is a foreground process, so start it detached; stop addresses the stop file."""
     if daemon_running():
-        try: (ROOT/"daemon.stop").touch()
+        try: target = (ROOT/"daemon.pid").read_text().strip()
+        except (FileNotFoundError, ValueError): target = ""
+        try: (ROOT/"daemon.stop").write_text(target)      # addressed, so a restart is not undone
         except OSError: return "Could not stop the daemon"
-        return "Stopping the daemon — it exits within 5 seconds"
+        return "Stopping the daemon"
     subprocess.Popen([sys.executable, CLI, "daemon", "start"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
