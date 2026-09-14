@@ -35,7 +35,13 @@ def herdr(*args, timeout=20):
     try:
         p=subprocess.run([os.environ.get("HERDR_BIN_PATH","herdr"),*args],text=True,capture_output=True,timeout=timeout)
         if p.returncode: return None
-        return json.loads(p.stdout)
+        data = json.loads(p.stdout)
+        # herdr reports failures as {"error": {...}} -- on stdout, with a non-zero exit today.
+        # Judging by the payload as well means a change in exit-code behaviour cannot quietly
+        # turn a failure into a result: `agent wait --timeout` returning an error object would
+        # otherwise read as "the agent is idle now" and prompt a busy agent.
+        if isinstance(data, dict) and "error" in data: return None
+        return data
     except Exception: return None
 def prompt(agent, text):
     return herdr("agent","prompt",agent,text)

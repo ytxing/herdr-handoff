@@ -105,6 +105,19 @@ class HandoffCliTests(HandoffTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
 
+    def test_an_error_payload_is_not_mistaken_for_a_result(self):
+        """herdr puts failures on stdout as {"error": ...} with a non-zero exit.
+
+        Judging by exit code alone would have been enough today, but the payload is what the
+        CLI actually promises; `agent wait --timeout` returning an error object that was read as
+        a result would prompt an agent that is still busy.
+        """
+        stub = Path(self.tmp.name) / "herdr"
+        stub.write_text('#!/bin/sh\nprintf %s \'{"error":{"code":"timeout"},"id":"x"}\'\nexit 0\n')
+        stub.chmod(0o755)
+        self.assertIsNone(self.handoff.herdr("agent", "wait", "wA:pX", "--until", "idle"),
+                          "an error payload must not be returned as a result")
+
     def test_no_test_delivers_to_a_live_agent(self):
         """Regression guard for a leak that put a real RESULT READY into a working agent pane.
 
