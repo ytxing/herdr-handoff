@@ -134,10 +134,14 @@ class DaemonLifecycleTests(HandoffTestBase):
                              env=dict(os.environ, HANDOFF_STATE_DIR=self.tmp.name),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL, start_new_session=True)
+        # Registered before the wait, not after it: an exception anywhere below used to abandon a
+        # daemon that had already been spawned, and a run that left sixteen of them behind is how
+        # this was noticed.
+        self.addCleanup(p.kill)
         for _ in range(50):
             if self.handoff.daemon_running(): return p
             time.sleep(0.1)
-        p.kill(); self.fail("daemon never took the lock")
+        self.fail("daemon never took the lock")
 
     def tearDown(self):
         if self.handoff.daemon_running():
