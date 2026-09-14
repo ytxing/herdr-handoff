@@ -1,11 +1,13 @@
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+FAKE_HERDR = ROOT / "tests" / "fake_herdr.py"
 
 INSERT = ("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since)"
           " values(?,?,?,?,?,?,?,?)")
@@ -25,11 +27,33 @@ class HandoffTestBase(unittest.TestCase):
         return subprocess.run(["python3", str(ROOT / "handoff.py"), *args], env=env,
                               text=True, capture_output=True)
 
+    def isolate_herdr(self):
+        """Route every herdr call through a stub, in-process and subprocess alike.
+
+        HERDR_BIN_PATH rather than a patch of handoff.prompt, because run_cli() shells out to
+        the CLI: an in-process patch never reaches the delivery that actually escapes. Without
+        this the `done` step of a state-flow test really delivers a [HANDOFF RESULT READY] to
+        whichever pane the fixture named -- which is how a live agent pane got a notification
+        for a task that never existed.
+        """
+        shim = Path(self.tmp.name) / "herdr"
+        shim.write_text('#!/bin/sh\nexec "%s" "%s" "$@"\n' % (sys.executable, FAKE_HERDR))
+        shim.chmod(0o755)
+        self._saved_herdr = os.environ.get("HERDR_BIN_PATH")
+        os.environ["HERDR_BIN_PATH"] = str(shim)
+        self.prompt_log = Path(self.tmp.name) / "prompts.log"
+        os.environ["FAKE_HERDR_LOG"] = str(self.prompt_log)
+
+    def delivered(self):
+        """Targets the code asked herdr to prompt. Empty means nothing left the test."""
+        if not self.prompt_log.exists(): return []
+        return [l.split("\t", 1)[0] for l in self.prompt_log.read_text().splitlines() if l]
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self._conns = []
         os.environ["HANDOFF_STATE_DIR"] = self.tmp.name
-        import sys
+        self.isolate_herdr()
         sys.path.insert(0, str(ROOT))
         sys.modules.pop("handoff", None)
         import handoff
@@ -39,6 +63,9 @@ class HandoffTestBase(unittest.TestCase):
         for c in self._conns:
             try: c.close()
             except Exception: pass
+        if self._saved_herdr is None: os.environ.pop("HERDR_BIN_PATH", None)
+        else: os.environ["HERDR_BIN_PATH"] = self._saved_herdr
+        os.environ.pop("FAKE_HERDR_LOG", None)
         os.environ.pop("HANDOFF_STATE_DIR", None)
         os.environ.pop("HERDR_PANE_ID", None)
         self.tmp.cleanup()
@@ -48,25 +75,25 @@ class HandoffCliTests(HandoffTestBase):
     def setUp(self):
         super().setUp()
         c = self.db()
-        c.execute(INSERT, ("t_test", "测试任务", "prompt", "wA:p1", "wA:p2",
+        c.execute(INSERT, ("t_test", "测试任务", "prompt", "wA:pTEST-SRC", "wA:pTEST-DST",
                            "published", "take", self.handoff.now()))
         c.commit()
 
     def test_core_state_flow(self):
         result_file = Path(self.tmp.name) / "result.md"
         result_file.write_text("ok")
-        identity = ('--pane', 'wA:p2')
+        identity = ('--pane', 'wA:pTEST-DST')
         for command, expected in [(('take', 't_test', *identity), 'active'),
                                   (('done', 't_test', '--result-file', str(result_file), *identity), 'result_ready'),
-                                  (('claim', 't_test', '--pane', 'wA:p1'), 'finished')]:
+                                  (('claim', 't_test', '--pane', 'wA:pTEST-SRC'), 'finished')]:
             result = self.run_cli(*command)
             self.assertEqual(result.returncode, 0, result.stderr)
             row = self.db().execute("select state from tasks where id='t_test'").fetchone()
             self.assertEqual(row[0], expected)
 
     def test_empty_description_rejected_by_parser(self):
-        result = self.run_cli("send", "--source-pane", "wA:p1",
-                              "--target-pane", "wA:p2",
+        result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
+                              "--target-pane", "wA:pTEST-DST",
                               "--description", " ", "--prompt", "x")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description", result.stderr)
@@ -75,6 +102,26 @@ class HandoffCliTests(HandoffTestBase):
         result = self.run_cli("delete", "t_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
+
+    def test_no_test_delivers_to_a_live_agent(self):
+        """Regression guard for a leak that put a real RESULT READY into a working agent pane.
+
+        The fixture used to name a real pane and handoff.prompt went straight to herdr, so the
+        `done` step below notified a live agent about a task that never existed. Isolation is
+        applied at HERDR_BIN_PATH because run_cli() shells out -- patching handoff.prompt in
+        this process would never reach the delivery that escapes.
+        """
+        result_file = Path(self.tmp.name) / "r.md"
+        result_file.write_text("ok")
+        for args in (("take", "t_test", "--pane", "wA:pTEST-DST"),
+                     ("done", "t_test", "--result-file", str(result_file), "--pane", "wA:pTEST-DST")):
+            self.assertEqual(self.run_cli(*args).returncode, 0)
+        # `done` notifies the Source, which is why the leaked notification landed on whichever
+        # live pane the fixture had named as source.
+        self.assertEqual(self.delivered(), ["wA:pTEST-SRC"],
+                         "the delivery was captured by the stub instead of reaching herdr")
+        self.assertIn("HANDOFF RESULT READY", self.prompt_log.read_text(),
+                      "and it is a real handoff notification, not a test-local stub of one")
 
 
 class BoardRenderTests(HandoffTestBase):
@@ -301,7 +348,7 @@ class BoardRenderTests(HandoffTestBase):
         c = self.db()
         c.execute("update tasks set state='finished', action='none' where id='t_cccc555566'")
         c.commit()
-        ident = ("--pane", "wA:p1")
+        ident = ("--pane", "wA:pTEST-DST")
         cases = [("take", ident), ("progress", ()), ("reply", ("--message", "x")),
                  ("reject", ("--reason", "no")), ("blocked", ("--reason", "stuck"))]
         for command, extra in cases:
@@ -317,7 +364,7 @@ class BoardRenderTests(HandoffTestBase):
         c = self.db()
         c.execute("update tasks set state='finished' where id='t_cccc555566'")
         c.commit()
-        result = self.run_cli("claim", "t_cccc555566", "--pane", "wA:p1")
+        result = self.run_cli("claim", "t_cccc555566", "--pane", "wA:pTEST-SRC")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_delete_tasks_removes_the_row_and_its_result_file(self):
