@@ -10,6 +10,20 @@ installation script in this package and try again.
 The first version supports one unfinished task at a time: Source A sends to Target B.
 Do not create parallel batches.
 
+## Confirm the Herdr pane first
+
+Use the exact `pane_id` returned by Herdr. Do not shorten it or type only the pane suffix.
+Before sending or updating a task, confirm the pane with:
+
+```sh
+herdr pane current --current
+herdr pane list --workspace <workspace-id>
+```
+
+Copy the complete value, such as `wA:p28`, into `handoff --source-pane`,
+`--target-pane`, or `--pane`. A value such as `p28` is incomplete and will be shown as
+absent even when Herdr has a live pane named `wA:p28`.
+
 ## Sending
 
 The sender must explicitly provide both Pane IDs:
