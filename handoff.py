@@ -94,6 +94,15 @@ REMINDER_WHY = {
     "accept": "You reviewed a result but have not marked the task finished yet.",
     "reply":  "This task is blocked on a question that only you can answer.",
 }
+# The pane that owns each pending action.  There is deliberately no fallback:
+# an unknown/non-action marker must never be turned into a reminder for Source.
+REMINDER_RECIPIENT = {
+    "take": "target",
+    "done": "target",
+    "claim": "source",
+    "accept": "source",
+    "reply": "source",
+}
 
 def reminder_text(row, action):
     """The nudge the daemon sends: says why, and gives the exact command for that action.
@@ -180,15 +189,16 @@ def daemon(a):
                 # target/source disappears or after a task is completed.  Never turn
                 # it into a source reminder: doing so used to send `none <task-id>`
                 # to the wrong pane.
-                if r["action"] == "none" or r["state"] in ("target_absent", "source_absent"):
+                recipient = REMINDER_RECIPIENT.get(r["action"])
+                if recipient is None or r["state"] in ("target_absent", "source_absent"):
                     continue
-                ag=r["target_pane"] if r["action"] in ("take","done") else r["source_pane"]
+                ag = r[f"{recipient}_pane"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
                 if info:
                     result = info.get("result", info) if isinstance(info,dict) else {}
                     agent_info = result.get("agent", result) if isinstance(result,dict) else {}
                     lifecycle = agent_info.get("agent_status", agent_info.get("status", "unknown")) if isinstance(agent_info,dict) else "unknown"
-                side = "target" if ag == r["target_pane"] else "source"
+                side = recipient
                 c.execute(f"update tasks set {side}_lifecycle=?, {side}_presence=? where id=?",(lifecycle,present,r['id'])); c.commit()
                 if present=="absent": transition(c,r["id"],"target_absent" if side == "target" else "source_absent","none",error="Herdr Agent absent"); continue
                 if lifecycle=="working":
@@ -203,7 +213,8 @@ def daemon(a):
                 fresh = c.execute("select * from tasks where id=?", (r["id"],)).fetchone()
                 if not fresh or fresh["state"] in ("finished", "rejected", "cancelled", "timeout"):
                     continue
-                if fresh["action"] == "none" or fresh["state"] in ("target_absent", "source_absent"):
+                if (fresh["action"] not in REMINDER_RECIPIENT or
+                        fresh["state"] in ("target_absent", "source_absent")):
                     continue
                 if fresh["state"] != r["state"] or fresh["action"] != r["action"]:
                     continue
