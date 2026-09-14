@@ -427,7 +427,9 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         i["dst_known"] = bool(i["dst_status"] and i["dst_status"][1])
         i["route"] = "%s → %s" % (i["src_label"], i["dst_label"])
         # ACTION names the actor too, so it needs the same resolution as the SRC/DST columns.
-        i["actor_label"] = i["dst_label"] if i["actor"] == i["dst_agent"] else i["src_label"]
+        # The action determines which side must act. Agent names are runtime metadata and
+        # are intentionally absent from the task record, so never compare stored names here.
+        i["actor_label"] = i["dst_label"] if i["action"] in ("take", "done") else i["src_label"]
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
