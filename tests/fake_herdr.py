@@ -33,6 +33,9 @@ def main(argv):
     cmd = argv[1:]
 
     if cmd[:2] == ["agent", "prompt"]:
+        if os.environ.get("FAKE_HERDR_PROMPT_FAIL"):
+            sys.stderr.write("fake_herdr: delivery refused\n")
+            return 1
         target = cmd[2] if len(cmd) > 2 else ""
         text = cmd[3] if len(cmd) > 3 else ""
         log = os.environ.get("FAKE_HERDR_LOG")

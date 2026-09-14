@@ -159,6 +159,38 @@ class HandoffCliTests(HandoffTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
 
+    def test_a_failed_delivery_leaves_no_next_step(self):
+        """`timeout` after a delivery failure must not name a command.
+
+        ACTION means "what happens next"; a terminal task has nothing next, and the `take` it
+        used to carry pointed at a pane that may not even exist.
+        """
+        os.environ["FAKE_HERDR_PROMPT_FAIL"] = "1"
+        try:
+            result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
+                                  "--target-pane", "wA:pTEST-FRESH",   # setUp's task holds pTEST-DST
+                                  "--description", "d", "--prompt", "p")
+        finally:
+            os.environ.pop("FAKE_HERDR_PROMPT_FAIL", None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tid = result.stdout.strip()
+        row = self.db().execute("select state,action from tasks where id=?", (tid,)).fetchone()
+        self.assertEqual(row["state"], "timeout")
+        self.assertEqual(row["action"], "none", "a terminal state names no next step")
+
+    def test_no_terminal_state_is_written_with_an_action(self):
+        """The invariant, read off the source rather than driven path by path.
+
+        Every state in CLOSED_STATES must be paired with action "none". This is the check that
+        stops `timeout` quietly regaining a `take` the next time that branch is touched.
+        """
+        src = (ROOT / "handoff.py").read_text()
+        for m in re.finditer(r'transition\(\s*c\s*,\s*[^,]+,\s*"([a-z_]+)"\s*,\s*"([a-z_]+)"', src):
+            state, action = m.group(1), m.group(2)
+            if state in self.handoff.CLOSED_STATES:
+                self.assertEqual(action, "none",
+                                 "%s is terminal but is written with action %r" % (state, action))
+
     def test_send_is_gated_per_target_not_per_store(self):
         """One window's long task must not block every other window on the same store.
 

@@ -158,7 +158,10 @@ def cmd_send(a):
         raise SystemExit("this target already has an unfinished task")
     row = {"id":tid, "description":a.description, "prompt":a.prompt,
            "source_pane":a.source_pane, "target_pane":a.target_pane}
-    if prompt(a.target_pane, task_text(row)) is None: transition(c,tid,"timeout","take",error="prompt failed")
+    # The delivery failed, so there is no next step: a terminal state carrying "take" would have
+    # the board name a command that can never run. Kept in step with the invariant that every
+    # state in CLOSED_STATES carries action "none".
+    if prompt(a.target_pane, task_text(row)) is None: transition(c,tid,"timeout","none",error="prompt failed")
     print(tid)
 
 def cmd_action(a):
