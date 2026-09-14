@@ -7,8 +7,8 @@ description: "Use the local Herdr task handoff service for one explicit A-to-B t
 
 Use the `handoff` command after installation. If it is not available, run the
 installation script in this package and try again.
-The first version supports one unfinished task at a time: Source A sends to Target B.
-Do not create parallel batches.
+One Target holds at most one unfinished task at a time. Different Targets are independent,
+so concurrent handoffs are fine as long as they are not aimed at the same pane.
 
 ## Confirm the Herdr pane first
 

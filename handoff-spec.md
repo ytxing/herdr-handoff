@@ -93,7 +93,8 @@ A: 检查结果
 A: handoff accept
 ```
 
-第一版只支持一个未结束的 A→B 任务，暂不支持批次或并发任务协调。
+同一个 Target 同一时间只能持有一个未结束任务（按 `target_pane` 判定）。不同 Target 之间互不阻塞；
+暂不支持把一个批次拆给多个 Target 协调。
 
 ## Prompt 模板
 

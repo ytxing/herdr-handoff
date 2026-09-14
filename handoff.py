@@ -127,8 +127,13 @@ def reminder_text(row, action):
 def cmd_send(a):
     if not a.description.strip(): raise SystemExit("description must not be empty")
     c=conn(); tid="t_"+uuid.uuid4().hex[:10]
-    if c.execute("select 1 from tasks where state not in ('finished','rejected','cancelled','timeout','target_absent','source_absent') limit 1").fetchone():
-        raise SystemExit("an unfinished task already exists")
+    # One open task per TARGET, not one per state store. The point is that a Target is never
+    # asked to work on two handoffs at once; scoping it globally meant one window's long
+    # experiment made `send` fail for every other window sharing the store.
+    if c.execute("select 1 from tasks where target_pane=? and state not in "
+                 "('finished','rejected','cancelled','timeout','target_absent','source_absent')"
+                 " limit 1", (a.target_pane,)).fetchone():
+        raise SystemExit("this target already has an unfinished task")
     # Explicit source and target are required; validate when Herdr is available.
     if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
     if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")

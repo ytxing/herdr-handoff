@@ -105,6 +105,25 @@ class HandoffCliTests(HandoffTestBase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
 
+    def test_send_is_gated_per_target_not_per_store(self):
+        """One window's long task must not block every other window on the same store.
+
+        The constraint exists so a Target is never handed two handoffs at once; scoping it to
+        the whole store made an unrelated experiment elsewhere fail `send` here.
+        """
+        c = self.db()
+        c.execute(INSERT, ("t_open", "占着 A 的任务", "p", "wA:pTEST-SRC", "wA:pTEST-A",
+                           "active", "done", self.handoff.now()))
+        c.commit()
+        same = self.run_cli("send", "--source-pane", "wA:pTEST-SRC", "--target-pane", "wA:pTEST-A",
+                            "--description", "d", "--prompt", "p")
+        self.assertNotEqual(same.returncode, 0, "one Target must not hold two open tasks")
+        self.assertIn("this target already has an unfinished task", same.stderr)
+
+        other = self.run_cli("send", "--source-pane", "wA:pTEST-SRC", "--target-pane", "wA:pTEST-B",
+                             "--description", "d", "--prompt", "p")
+        self.assertEqual(other.returncode, 0, other.stderr)
+
     def test_an_error_payload_is_not_mistaken_for_a_result(self):
         """herdr puts failures on stdout as {"error": ...} with a non-zero exit.
 
