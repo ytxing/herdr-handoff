@@ -126,6 +126,34 @@ class HandoffCliTests(HandoffTestBase):
             finally:
                 self.handoff.ROOT, self.handoff.DB = saved
 
+    def test_list_warns_about_a_degraded_store(self):
+        """A store that could not take the index must not look healthy.
+
+        The migration skips the index when legacy duplicates block it, which silently gives up
+        the one-open-task-per-Target guarantee. list is the diagnostic entry point, so it says
+        so -- on stderr, leaving the tab-separated stdout that scripts parse untouched.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "handoff.sqlite3"
+            raw = sqlite3.connect(db)
+            raw.execute("create table tasks(id text primary key, description text not null,"
+                        " prompt text not null, source_pane text not null, target_pane text not null,"
+                        " state text not null, action text not null, state_since text not null)")
+            for tid in ("t_a", "t_b"):
+                raw.execute("insert into tasks values(?,?,?,?,?,?,?,?)",
+                            (tid, "旧数据", "p", "wA:pX", "wA:pSAME", "active", "done", "2026-01-01"))
+            raw.commit(); raw.close()
+            env = os.environ.copy(); env["HANDOFF_STATE_DIR"] = d
+            out = subprocess.run(["python3", str(ROOT / "handoff.py"), "list"],
+                                 env=env, text=True, capture_output=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("wA:pSAME", out.stderr, "the duplicate Target is named")
+        self.assertIn("not in force", out.stderr)
+        self.assertEqual(len(out.stdout.strip().splitlines()), 2,
+                         "stdout stays the plain task listing that scripts parse")
+        self.assertNotIn("not in force", out.stdout,
+                         "the warning stays on stderr; scripts parse stdout")
+
     def test_delete_removes_task(self):
         result = self.run_cli("delete", "t_test")
         self.assertEqual(result.returncode, 0, result.stderr)

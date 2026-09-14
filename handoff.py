@@ -195,8 +195,23 @@ def cmd_action(a):
         if p.resolve() != dest.resolve(): shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done-implicit")
 
+def duplicate_open_targets(c):
+    """Targets held by more than one open task. Only reachable when the index is missing."""
+    marks = ",".join("?" * len(CLOSED_STATES))
+    return c.execute("select target_pane, count(*) n from tasks where state not in (%s)"
+                     " group by target_pane having n > 1" % marks,
+                     tuple(CLOSED_STATES)).fetchall()
+
 def cmd_list(_):
-    for r in conn().execute("select * from tasks order by state_since"):
+    c = conn()
+    # conn() skips the index when legacy duplicates stop it being created, which leaves the
+    # store without its one-open-task-per-Target guarantee. Say so rather than degrade quietly:
+    # in that state two concurrent sends can both get through.
+    for r in duplicate_open_targets(c):
+        sys.stderr.write("handoff: %s holds %d open tasks; the one-open-task-per-target "
+                         "index is not in force until that is resolved\n"
+                         % (r["target_pane"], r["n"]))
+    for r in c.execute("select * from tasks order by state_since"):
         age=int(time.time()-datetime.fromisoformat(r["state_since"]).timestamp())
         print(f"{r['id']}\t{r['description'].replace(chr(10),' / ')}\t{r['source_pane']} → {r['target_pane']}\t{r['state']}\t{r['action']}\t{age}s")
 def daemon(a):
