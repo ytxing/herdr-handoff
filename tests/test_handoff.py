@@ -392,9 +392,28 @@ class BoardRenderTests(HandoffTestBase):
                 self.assertLessEqual(self.handoff._dw(line), width,
                                      "width=%d produced %r" % (width, line))
 
+    def test_the_cursor_and_checked_rows_carry_a_background(self):
+        """Whole-row highlight, not just the marker character.
+
+        A background has to go on every cell and separator: each cell ends with its own reset,
+        so wrapping the finished line would not survive past the first one.
+        """
+        self.handoff._ANSI_ON = True
+        try:
+            lines = self.board(150, selected={"t_aaaa111122"}, cursor=1).split("\n")
+        finally:
+            self.handoff._ANSI_ON = False
+        row_of = lambda tid: [l for l in lines if tid in l][0]
+        self.assertIn("\033[48;5;238m", row_of("t_bbbb333344"),   # cursor=1 in this fixture
+                      "the cursor row is backgrounded")
+        self.assertIn("\033[48;5;235m", row_of("t_aaaa111122"),
+                      "a checked row is backgrounded, at the weaker shade")
+        self.assertNotIn("\033[48;5;", row_of("t_cccc555566"),
+                         "an untouched row stays plain")
+
     def test_checkbox_and_cursor_render_on_the_right_rows(self):
         lines = self.board(130, selected={"t_bbbb333344"}, cursor=1).split("\n")
-        cursors = [l for l in lines if l.startswith("❯")]
+        cursors = [l for l in lines if l.startswith(">")]
         self.assertEqual(len(cursors), 1, "exactly one row carries the cursor")
         self.assertIn("t_bbbb333344", cursors[0])
         self.assertIn("[x]", cursors[0], "the cursor row is the one that was selected")
@@ -457,7 +476,7 @@ class BoardRenderTests(HandoffTestBase):
         height = 12
         lines = self.handoff.render_board(120, statuses=self.statuses, items=items,
                                           height=height, cursor=last).split("\n")
-        marked = [l for l in lines if l.startswith("❯")]
+        marked = [l for l in lines if l.startswith(">")]
         self.assertEqual(len(marked), 1, "the cursor row must stay on screen")
         self.assertIn(items[last]["id"], marked[0])
         room = height - self.handoff.BOARD_CHROME

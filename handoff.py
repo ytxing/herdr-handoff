@@ -305,7 +305,10 @@ STATE_STYLE = {"published":("blue",),"active":("cyan",),"result_ready":("magenta
 ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept","none":"—"}
 # No bold anywhere: weight is carried by colour alone. The bold codes are deliberately
 # absent from this table so a stray `("boldred",)` fails to render instead of creeping back.
-_CODES = {"dim":"2","red":"31","green":"32","yellow":"33","blue":"34","magenta":"35","cyan":"36"}
+_CODES = {"dim":"2","red":"31","green":"32","yellow":"33","blue":"34","magenta":"35","cyan":"36",
+          # Row backgrounds. The cursor row is the brighter of the two; a row that is both is
+          # shown as the cursor, since that is what the next keypress will act on.
+          "bg_cursor":"48;5;238", "bg_picked":"48;5;235"}
 _ANSI_ON = False
 
 def _use_color():
@@ -637,8 +640,12 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         else: break
     desc_w = max(4, width - fixed())
 
-    def row(cells):
-        """Each cell is (text_or_segments, styles, width, align); last cell is not padded."""
+    def row(cells, bg=()):
+        """Each cell is (text_or_segments, styles, width, align); last cell is not padded.
+
+        `bg` is applied to every cell and to the separators between them. Wrapping the finished
+        line in a background would not survive: every cell ends with its own reset.
+        """
         parts = []
         for idx, (text, styles, w, align) in enumerate(cells):
             if isinstance(text,(list,tuple)):
@@ -649,8 +656,8 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
             if idx < len(cells)-1:
                 gap = max(0, w - _dw("".join(s for s,_ in segs)))
                 segs = ([(" "*gap, ())] + segs) if align == "r" else (segs + [(" "*gap, ())])
-            parts.append("".join(_paint(s, st) for s, st in segs))
-        return "  ".join(parts).rstrip()
+            parts.append("".join(_paint(s, *(tuple(bg) + tuple(st))) for s, st in segs))
+        return _paint("  ", *bg).join(parts).rstrip()
 
     def routing_cells(i, dim, header):
         if header:
@@ -664,13 +671,13 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if routing == "route": return [(i["route"], dim, krt, "l")]
         return []
 
-    def assemble(mark, _id, desc, state, nxt, age, ms, ds, ss, ns, as_, i=None, header=False):
+    def assemble(mark, _id, desc, state, nxt, age, ms, ds, ss, ns, as_, i=None, header=False, bg=()):
         cells = [(mark, ms, MARK_W, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
         cells += routing_cells(i, ds, header)
         cells.append((state, ss, kst, "l"))
         if show_action: cells.append((nxt, ns, knx, "l"))
         cells.append((age, as_, kag, "r"))
-        return row(cells)
+        return row(cells, bg)
 
     n = len(items)
     # Bound the frame to the terminal height. A frame taller than the pane scrolls on every
@@ -703,12 +710,14 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         here = start + idx == cursor
         ds = ("dim",) if i["closed"] else ()
         nxt, ns = next_cell(i)
-        glyph = "❯" if here else ("▸" if i["mine"] else " ")
-        box = "[x]" if i["id"] in selected else "[ ]"
+        picked = i["id"] in selected
+        glyph = ">" if here else ("▸" if i["mine"] else " ")
+        box = "[x]" if picked else "[ ]"
         ms = ("cyan",) if here else (("yellow",) if i["mine"] else ds)
+        bg = ("bg_cursor",) if here else (("bg_picked",) if picked else ())
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
                               i["state"], nxt, i["age"],
-                              ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i))
+                              ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i, bg=bg))
     # The last two lines are fixed furniture: the message line, then the key legend.
     # The message line is reserved even when empty so the board never shifts under a keypress.
     lines.append("")
