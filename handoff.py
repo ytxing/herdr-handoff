@@ -177,32 +177,39 @@ def daemon(a):
     if a.op=="status":
         print("running" if daemon_running() else "stopped"); return
     if a.op=="stop":
-        if not daemon_running(): print("no daemon is running"); return
-        # Address the request. A bare stop file would also be honoured by whatever daemon is
-        # running by the time it lands, so a `stop` followed quickly by `start` could kill the
-        # replacement -- the request was aimed at the instance that had already exited.
-        try: target = (ROOT/"daemon.pid").read_text().strip()
-        except (FileNotFoundError, ValueError): target = ""      # unaddressed: any daemon
-        try: (ROOT/"daemon.stop").write_text(target)
-        except OSError: raise SystemExit("could not write the stop file")
+        ok, message = request_stop()
+        if not ok:
+            if message == NO_DAEMON: print(message); return
+            raise SystemExit(message)
         # Report what actually happened rather than that the request was filed. A sweep parked
-        # on a busy agent can take a slice plus a sleep to come round, so the budget covers that.
+        # on a busy agent takes at most one slice to notice (it re-checks between tasks), so the
+        # budget covers that with room to spare.
         for _ in range(150):
             if not daemon_running(): print("daemon stopped"); return
             time.sleep(0.1)
         raise SystemExit("the daemon did not stop within 15 seconds")
-    lock = daemon_lock(retries=3)
-    if lock is None:
-        raise SystemExit("a daemon is already running")   # its pid is in daemon.pid
+    guard = lifecycle_lock(retries=3)
+    if guard is None:
+        raise SystemExit("another start or stop is in progress; try again")
     try:
+        lock = daemon_lock()
+        if lock is None:
+            raise SystemExit("a daemon is already running")   # its pid is in daemon.pid
         # Only reachable when no daemon holds the lock, so clearing a leftover stop file here
-        # cannot rob a running daemon of its own shutdown request.
+        # cannot rob a running daemon of its own shutdown request. Publishing the pid inside the
+        # guard is what stops a concurrent stop from reading it as it changes hands.
         try: (ROOT/"daemon.stop").unlink()
         except FileNotFoundError: pass
         (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
+    finally:
+        guard.close()
+    try:
         while not stop_requested():
             c=conn()
             for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
+                # Re-check between tasks: every busy agent costs a wait slice, so a sweep full of
+                # them would otherwise run past the budget `daemon stop` allows for.
+                if stop_requested(): break
                 # `none` is a terminal/non-action marker.  It can be written when a
                 # target/source disappears or after a task is completed.  Never turn
                 # it into a source reminder: doing so used to send `none <task-id>`
@@ -224,7 +231,8 @@ def daemon(a):
                     # bounded. Waiting indefinitely parked the daemon for as long as an agent
                     # stayed busy, so `stop` reported failure while it was simply waiting.
                     if herdr("agent","wait",ag,"--until","idle",
-                             "--timeout",str(AGENT_WAIT_SLICE_MS), timeout=30) is None:
+                             "--timeout",str(AGENT_WAIT_SLICE_MS),
+                             timeout=AGENT_WAIT_SLICE_MS/1000.0 + 5) is None:
                         continue      # still working; the next sweep re-checks the stop file
                 # The agent may have completed the action while the status query or wait was
                 # in progress. Re-read before prompting so a stale row cannot send the old
@@ -421,19 +429,15 @@ def stop_requested():
     except FileNotFoundError: return False
     return target in ("", str(os.getpid()))
 
-def daemon_lock(retries=0):
-    """Take the exclusive lock that makes a second daemon impossible.
+def _flock(path, retries=0):
+    """Take an exclusive advisory lock. Returns the handle, or None if it is held elsewhere.
 
-    A pid file cannot express liveness. `kill -9` leaves one behind naming a process that no
-    longer exists, and nothing in user space can tell that from a live daemon -- which is how
-    a running daemon came to be displayed as stopped. The kernel releases this lock when its
-    holder dies, however it dies.
-
-    Keeps the handle alive for the daemon's lifetime; closing it releases the lock.
+    Keeps the handle alive for as long as the lock is wanted; closing it releases the lock. The
+    kernel releases it too if the holder dies, which is the property a pid file cannot promise.
     """
     ROOT.mkdir(parents=True, exist_ok=True)
     for attempt in range(retries + 1):
-        fh = open(ROOT/"daemon.lock", "a")      # append: never truncate, just create if missing
+        fh = open(path, "a")            # append: never truncate, just create if missing
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return fh
@@ -443,6 +447,38 @@ def daemon_lock(retries=0):
         except OSError:
             fh.close(); raise       # a real IO error must not masquerade as "already running"
     return None
+
+def daemon_lock(retries=0):
+    """The lock a running daemon holds for its whole life."""
+    return _flock(ROOT/"daemon.lock", retries)
+
+def lifecycle_lock(retries=0):
+    """Serialises start against stop.
+
+    Without it, `stop` could check that a daemon was running, have that daemon exit, and then
+    read the pid of the daemon that replaced it -- addressing the request at the wrong instance,
+    which would dutifully stop. Holding this across the running-check, the pid read and the
+    request write makes the decision atomic with respect to a start, which needs it too.
+    """
+    return _flock(ROOT/"daemon.lifecycle", retries)
+
+NO_DAEMON = "no daemon is running"
+
+def request_stop():
+    """Ask the daemon that is running now to stop. Returns (ok, message)."""
+    guard = lifecycle_lock(retries=3)
+    if guard is None: return False, "another start or stop is in progress; try again"
+    try:
+        if not daemon_running(): return False, NO_DAEMON
+        # Read the pid inside the guard: a replacement cannot have taken over since the check,
+        # so this names the daemon the request is actually meant for.
+        try: target = (ROOT/"daemon.pid").read_text().strip()
+        except (FileNotFoundError, ValueError): target = ""
+        try: (ROOT/"daemon.stop").write_text(target)
+        except OSError: return False, "could not write the stop file"
+        return True, "stopping"
+    finally:
+        guard.close()
 
 def daemon_running():
     """True only while a daemon actually holds the lock."""
@@ -707,13 +743,10 @@ def _read_key(timeout):
     return {b"A":"UP", b"B":"DOWN", b"C":"RIGHT", b"D":"LEFT"}.get(os.read(fd, 1))
 
 def toggle_daemon():
-    """The daemon is a foreground process, so start it detached; stop addresses the stop file."""
-    if daemon_running():
-        try: target = (ROOT/"daemon.pid").read_text().strip()
-        except (FileNotFoundError, ValueError): target = ""
-        try: (ROOT/"daemon.stop").write_text(target)      # addressed, so a restart is not undone
-        except OSError: return "Could not stop the daemon"
-        return "Stopping the daemon"
+    """The daemon is a foreground process, so start it detached; stopping goes through the guard."""
+    ok, message = request_stop()
+    if ok: return "Stopping the daemon"
+    if message != NO_DAEMON: return message      # the guard was busy, or the write failed
     subprocess.Popen([sys.executable, CLI, "daemon", "start"],
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)

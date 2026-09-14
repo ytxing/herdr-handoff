@@ -129,6 +129,14 @@ class HandoffCliTests(HandoffTestBase):
 class DaemonLifecycleTests(HandoffTestBase):
     """Uniqueness must not rest on a file that outlives the process it describes."""
 
+    def reap(self, p):
+        """Idempotent cleanup: a daemon that already exited must not fail the teardown, and one
+        that was killed still has to be waited on or it stays a zombie for the whole run."""
+        try: p.kill()
+        except ProcessLookupError: pass
+        try: p.wait(timeout=5)
+        except subprocess.TimeoutExpired: pass
+
     def start_daemon(self):
         p = subprocess.Popen([sys.executable, str(ROOT / "handoff.py"), "daemon", "start"],
                              env=dict(os.environ, HANDOFF_STATE_DIR=self.tmp.name),
@@ -137,7 +145,7 @@ class DaemonLifecycleTests(HandoffTestBase):
         # Registered before the wait, not after it: an exception anywhere below used to abandon a
         # daemon that had already been spawned, and a run that left sixteen of them behind is how
         # this was noticed.
-        self.addCleanup(p.kill)
+        self.addCleanup(self.reap, p)
         for _ in range(50):
             if self.handoff.daemon_running(): return p
             time.sleep(0.1)
@@ -158,7 +166,7 @@ class DaemonLifecycleTests(HandoffTestBase):
             self.assertNotEqual(second.returncode, 0, "a second daemon must not be allowed")
             self.assertIn("already running", second.stderr)
         finally:
-            p.kill()
+            self.reap(p)
 
     def test_status_agrees_with_the_board(self):
         """The CLI used to answer from the mere existence of the pid file, so the two disagreed."""
@@ -169,7 +177,7 @@ class DaemonLifecycleTests(HandoffTestBase):
             self.assertEqual(self.run_cli("daemon", "status").stdout.strip(), "running")
             self.assertTrue(self.handoff.daemon_running())
         finally:
-            p.kill()
+            self.reap(p)
 
     def test_a_killed_daemon_does_not_read_as_running(self):
         """The reported bug: SIGKILL left a pid file naming a process that no longer existed.
@@ -198,7 +206,7 @@ class DaemonLifecycleTests(HandoffTestBase):
             self.assertEqual(int((Path(self.tmp.name) / "daemon.pid").read_text()), q.pid,
                              "the pid file now names the daemon that is actually running")
         finally:
-            q.kill()
+            self.reap(q)
 
     def test_stop_works_while_the_daemon_waits_on_a_busy_agent(self):
         """A review finding: an unbounded `herdr agent wait` parked the daemon.
@@ -222,7 +230,41 @@ class DaemonLifecycleTests(HandoffTestBase):
         finally:
             os.environ.pop("FAKE_HERDR_STATUS", None)
             os.environ.pop("FAKE_HERDR_WAIT_S", None)
-            if p: p.kill()
+            if p: self.reap(p)
+
+    def test_stop_request_names_the_daemon_that_is_running(self):
+        p = self.start_daemon()
+        try:
+            ok, message = self.handoff.request_stop()
+            self.assertTrue(ok, message)
+            self.assertEqual((Path(self.tmp.name) / "daemon.stop").read_text().strip(), str(p.pid),
+                             "the request must name the instance it was aimed at")
+        finally:
+            self.reap(p)
+
+    def test_a_start_cannot_slip_in_while_a_stop_is_deciding(self):
+        """The race the second review described, pinned.
+
+        While a stop holds the lifecycle guard no start can complete, so the pid it reads cannot
+        be that of a replacement. Reading a successor's pid and addressing the request at it is
+        how the previous attempt managed to stop exactly the wrong instance.
+        """
+        p = self.start_daemon()
+        try:
+            guard = self.handoff.lifecycle_lock()
+            self.assertIsNotNone(guard, "the guard is free while only a daemon holds the main lock")
+            try:
+                blocked = self.run_cli("daemon", "start")
+                self.assertNotEqual(blocked.returncode, 0)
+                self.assertIn("another start or stop is in progress", blocked.stderr)
+            finally:
+                guard.close()
+            # and with the guard released the same start goes through, so the guard is the only
+            # thing that was in its way
+            after = self.run_cli("daemon", "start")
+            self.assertIn("already running", after.stderr)
+        finally:
+            self.reap(p)
 
     def test_a_stop_addressed_to_another_daemon_is_ignored(self):
         """A review finding: `stop` used to be a broadcast.
@@ -238,7 +280,7 @@ class DaemonLifecycleTests(HandoffTestBase):
             self.assertTrue(self.handoff.daemon_running(),
                             "a request addressed to a different daemon must be ignored")
         finally:
-            p.kill()
+            self.reap(p)
 
     def test_an_unaddressed_stop_file_still_stops(self):
         """A plain `touch daemon.stop` means "whichever daemon is running" and must keep working."""
@@ -250,7 +292,7 @@ class DaemonLifecycleTests(HandoffTestBase):
                 time.sleep(0.1)
             self.assertFalse(self.handoff.daemon_running())
         finally:
-            p.kill()
+            self.reap(p)
 
     def test_stop_reports_whether_it_actually_stopped(self):
         self.assertEqual(self.run_cli("daemon", "stop").stdout.strip(), "no daemon is running")
