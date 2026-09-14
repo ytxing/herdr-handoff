@@ -43,7 +43,7 @@ A 领取并验收：
 ./handoff delete --all
 ```
 
-后台不会解析终端自然语言。B 必须显式执行 `take` 和 `done`；A 必须显式执行 `claim` 和 `accept`。有 handoff task 时，B 不要直接使用 `herdr agent prompt` 回报 A，统一通过 `handoff done`，由服务通知 A。
+后台不会解析终端自然语言。B 必须显式执行 `take` 和 `done`；A 必须显式执行 `claim`。有 handoff task 时，B 通过 `handoff done` 回报，服务会通知 A。
 
 ## 看板操作
 
@@ -94,4 +94,4 @@ python3 -m unittest discover -s tests -v
 
 ## Agent Skill
 
-通用 Agent 指令位于 `skill/SKILL.md`。将该目录复制到你的 Agent harness 的 skills 目录，并确保该 Agent 能访问 `handoff` 全局命令。Skill 只使用 Herdr 的通用概念和 CLI，不包含特定模型、供应商或 Agent harness 参数。
+通用 Agent 指令位于 `herdr-task-handoff/SKILL.md`。将该目录复制到你的 Agent harness 的 skills 目录，并确保该 Agent 能访问 `handoff` 全局命令。Skill 只使用 Herdr 的通用概念和 CLI，不包含特定模型、供应商或 Agent harness 参数。

@@ -5,16 +5,14 @@ description: "Use the local Herdr task handoff service for one explicit A-to-B t
 
 # Herdr Task Handoff
 
-Use the global `handoff` entrypoint, or the files in this standalone repository. The
-canonical locations are `/Users/ytxing/workspace/herdr-task-handoff/handoff` and
-`/Users/ytxing/workspace/herdr-task-handoff/handoff.py`. Do not invoke an old copy under
-`project-g` or any other `handoff.py` path: that copy may use a different database schema.
+Use the `handoff` command after installation. If it is not available, run the
+installation script in this package and try again.
 The first version supports one unfinished task at a time: Source A sends to Target B.
 Do not create parallel batches.
 
 ## Sending
 
-The sender must explicitly provide both Herdr identities; do not infer Source:
+The sender must explicitly provide both Pane IDs:
 
 ```sh
 ./handoff send \
