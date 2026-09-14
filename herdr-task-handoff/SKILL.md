@@ -1,12 +1,14 @@
 ---
 name: herdr-task-handoff
-description: "Use the local handoff service for a single explicit A-to-B Herdr task, including send, take, done, claim, accept, timeout reminders, and the terminal board."
+description: "Use the local Herdr task handoff service for one explicit A-to-B task, including delivery, completion, reminders, and the terminal board."
 ---
 
 # Herdr Task Handoff
 
-Use the `handoff` entrypoint from this distribution. If it is not on `PATH`, run the
-included `install-global.sh` first or invoke `./handoff` from the plugin directory.
+Use the global `handoff` entrypoint, or the files in this standalone repository. The
+canonical locations are `/Users/ytxing/workspace/herdr-task-handoff/handoff` and
+`/Users/ytxing/workspace/herdr-task-handoff/handoff.py`. Do not invoke an old copy under
+`project-g` or any other `handoff.py` path: that copy may use a different database schema.
 The first version supports one unfinished task at a time: Source A sends to Target B.
 Do not create parallel batches.
 
@@ -32,13 +34,13 @@ and result notification.
 When a task arrives, execute `take` before doing work:
 
 ```sh
-./handoff take <task-id>
+./handoff take <task-id> --pane <your-pane>
 ```
 
 When finished, write a readable result file and run:
 
 ```sh
-./handoff done <task-id> --result-file <path>
+./handoff done <task-id> --result-file <path> --pane <your-pane>
 ```
 
 For a task with a handoff ID, do not use `herdr agent prompt` to return the result to
@@ -56,7 +58,7 @@ When Source answers a blocked task, run `reply <task-id> --message "<answer>"`.
 When the result prompt arrives, run:
 
 ```sh
-./handoff claim <task-id>
+./handoff claim <task-id> --pane <your-pane>
 ```
 
 Inspect the saved result, then mark the task finished:
@@ -122,5 +124,5 @@ current state. This covers `take`, `progress`, `done`, `done-implicit`, `reply`,
 `reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
 to `active`, redo the work, overwrite the saved result and notify the Source a second time.
 
-`claim` and `accept` are deliberately exempt: they land on `finished`, so re-running one is a
+`claim` is deliberately idempotent: it lands on `finished`, so re-running it is a
 harmless retry rather than a resurrection.
