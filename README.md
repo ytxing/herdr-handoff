@@ -5,7 +5,7 @@
 ## 快速使用
 
 ```sh
-cd Skills/handoff
+cd herdr-task-handoff
 ./install-global.sh
 handoff --help
 
