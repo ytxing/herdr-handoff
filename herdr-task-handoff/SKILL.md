@@ -111,7 +111,7 @@ The board is interactive and can act on tasks, not just display them:
 | `r` | re-send the stored prompt to the Targets of the checked tasks |
 | `d` | delete the checked tasks — asks for confirmation first |
 | `y`, `Enter` | confirm the pending delete; any other key cancels it |
-| `t` | start or stop the daemon |
+| `t` | start or stop the daemon, after a confirmation |
 | `q`, `Ctrl-C` | quit |
 
 `r` re-sends only a task still open as `published` or `active`, and only to a Target whose
@@ -120,6 +120,29 @@ skipped and the board says why on its own line above the key legend. Herdr itsel
 refuse a prompt to a busy agent, so this check is what keeps the board from interrupting work
 already in progress. A re-send is headed `[HANDOFF TASK — RE-SENT]` and names the state the
 task is still in, so the Target can tell a nudge from a new task.
+
+## Daemon single-instance guarantee
+
+Enforced by a file lock (`daemon.lock`), not by the pid file. A pid file outlives its process:
+`kill -9` leaves one behind naming something that no longer exists, and nothing in user space
+can tell that from a live daemon -- which is how a running daemon came to be shown as stopped.
+The kernel releases the lock when its holder dies, so it cannot go stale. The pid file stays,
+but only as a convenience for humans.
+
+- `daemon start` refuses when another daemon holds the lock, instead of running a second one
+  that would overwrite the record and double-deliver every reminder
+- `daemon status` applies the same check as the board, so the two cannot disagree
+- `daemon stop` waits for the lock to actually free before reporting success, and says
+  `no daemon is running` when there is nothing to stop
+- `t` on the board asks for confirmation first
+
+## Board states
+
+The STATE column prints the state name verbatim -- `published`, `active`, `result_ready`,
+`finished`, `rejected`, `cancelled`, `timeout`, `*_absent` -- and colours each one. That is
+the same word `handoff delete --state <name>` takes, so what the board shows can be pasted
+into a command. Earlier only `result_ready` was prettified to "result ready", which made the
+one that differed the hardest to match against anything.
 
 Protocol reminders default to 30 seconds. Execution and review backoff default to 2, 4,
 8 minutes and cap at 8 hours. If an expected Agent is `working`, the daemon first uses

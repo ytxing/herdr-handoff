@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Small, dependency-free Herdr handoff coordinator."""
-import argparse, json, os, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
+import argparse, fcntl, json, os, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -172,16 +172,27 @@ def cmd_list(_):
         age=int(time.time()-datetime.fromisoformat(r["state_since"]).timestamp())
         print(f"{r['id']}\t{r['description'].replace(chr(10),' / ')}\t{r['source_pane']} → {r['target_pane']}\t{r['state']}\t{r['action']}\t{age}s")
 def daemon(a):
-    if a.op=="status": print("running" if (ROOT/"daemon.pid").exists() else "stopped"); return
+    if a.op=="status":
+        print("running" if daemon_running() else "stopped"); return
     if a.op=="stop":
+        if not daemon_running(): print("no daemon is running"); return
         try: (ROOT/"daemon.stop").touch()
-        except: pass
-        return
-    ROOT.mkdir(parents=True,exist_ok=True)
-    try: (ROOT/"daemon.stop").unlink()
-    except FileNotFoundError: pass
-    (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
+        except OSError: raise SystemExit("could not write the stop file")
+        # The daemon notices on its next sweep, so report what actually happened rather than
+        # just that the request was filed. "stop" that quietly did nothing is its own bug.
+        for _ in range(60):
+            if not daemon_running(): print("daemon stopped"); return
+            time.sleep(0.1)
+        raise SystemExit("the daemon did not stop within 6 seconds")
+    lock = daemon_lock(retries=3)
+    if lock is None:
+        raise SystemExit("a daemon is already running")   # its pid is in daemon.pid
     try:
+        # Only reachable when no daemon holds the lock, so clearing a leftover stop file here
+        # cannot rob a running daemon of its own shutdown request.
+        try: (ROOT/"daemon.stop").unlink()
+        except FileNotFoundError: pass
+        (ROOT/"daemon.pid").write_text(str(os.getpid())); print("daemon started")
         while not (ROOT/"daemon.stop").exists():
             c=conn()
             for r in c.execute("select * from tasks where state not in ('finished','rejected','cancelled','timeout')").fetchall():
@@ -232,9 +243,16 @@ def daemon(a):
                     c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+delay,timezone.utc).isoformat(),r['id'])); c.commit()
             time.sleep(5)
     finally:
-        for p in (ROOT/"daemon.pid",ROOT/"daemon.stop"):
-            try:p.unlink()
-            except:pass
+        # Only remove the pid file if it still names this process. Deleting it blind let a
+        # daemon that was exiting erase the record belonging to whoever holds the daemon role
+        # now, leaving a live daemon with nothing pointing at it.
+        try:
+            if (ROOT/"daemon.pid").read_text().strip() == str(os.getpid()):
+                (ROOT/"daemon.pid").unlink()
+        except (FileNotFoundError, ValueError): pass
+        try: (ROOT/"daemon.stop").unlink()
+        except FileNotFoundError: pass
+        lock.close()               # releases the flock; the kernel would do it anyway
 # ---------- board rendering ----------
 
 CLOSED_STATES = ("finished","rejected","cancelled","timeout",
@@ -242,10 +260,9 @@ CLOSED_STATES = ("finished","rejected","cancelled","timeout",
 # Commands that would move a closed task back into the live set. `claim`/`accept` are absent on
 # purpose: they land on `finished`, so re-running one is a harmless retry, not a resurrection.
 RESURRECTING_COMMANDS = ("take","progress","done","done-implicit","reply","blocked","reject")
-STATE_LABEL = {"published":"published","active":"active","result_ready":"result ready",
-               "finished":"finished","rejected":"rejected",
-               "cancelled":"cancelled","timeout":"timeout",
-               "target_absent":"target absent","source_absent":"source absent"}
+# The board prints the state name verbatim: it is the same word `handoff delete --state <name>`
+# takes, and six of the seven states were already shown untranslated -- only `result_ready` was
+# being prettified, which made the one that differed the hardest to match against a command.
 STATE_STYLE = {"published":("blue",),"active":("cyan",),"result_ready":("magenta",),
                "finished":("green",),"rejected":("red",),
                "cancelled":("dim",),"timeout":("red",),
@@ -385,13 +402,33 @@ def not_ready_reason(entry):
     if entry is None: return "it is no longer in Herdr"
     return NOT_READY_REASON.get(entry[0], "it is %s" % entry[0])
 
+def daemon_lock(retries=0):
+    """Take the exclusive lock that makes a second daemon impossible.
+
+    A pid file cannot express liveness. `kill -9` leaves one behind naming a process that no
+    longer exists, and nothing in user space can tell that from a live daemon -- which is how
+    a running daemon came to be displayed as stopped. The kernel releases this lock when its
+    holder dies, however it dies.
+
+    Keeps the handle alive for the daemon's lifetime; closing it releases the lock.
+    """
+    ROOT.mkdir(parents=True, exist_ok=True)
+    for attempt in range(retries + 1):
+        fh = open(ROOT/"daemon.lock", "a")      # append: never truncate, just create if missing
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            fh.close()
+            if attempt < retries: time.sleep(0.1)   # the board probes this lock every second
+    return None
+
 def daemon_running():
-    """True only if the pid file names a live process — a stale file must not read as running."""
-    pidfile = ROOT/"daemon.pid"
-    if not pidfile.exists(): return False
-    try:
-        os.kill(int(pidfile.read_text().strip()), 0); return True
-    except (ValueError, OSError): return False
+    """True only while a daemon actually holds the lock."""
+    if not (ROOT/"daemon.lock").exists(): return False
+    fh = daemon_lock()
+    if fh is None: return True                  # the lock is held: a daemon is alive
+    fh.close(); return False
 
 def board_items():
     """Query tasks and enrich each with routing, computed age and ownership."""
@@ -473,7 +510,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         return max([_dw(header)] + [_dw(v) for v in values])
 
     kid = widest("ID", [i["id"] for i in items])
-    kst = widest("STATE", [STATE_LABEL.get(i["state"], i["state"]) for i in items])
+    kst = widest("STATE", [i["state"] for i in items])
     kag = widest("AGE", [i["age"] for i in items])
     knx = widest("ACTION", [next_cell(i)[0] for i in items])
     krt = widest("ROUTE", [i["route"] for i in items])
@@ -595,7 +632,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         box = "[x]" if i["id"] in selected else "[ ]"
         ms = ("cyan",) if here else (("yellow",) if i["mine"] else ds)
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
-                              STATE_LABEL.get(i["state"], i["state"]), nxt, i["age"],
+                              i["state"], nxt, i["age"],
                               ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i))
     # The last two lines are fixed furniture: the message line, then the key legend.
     # The message line is reserved even when empty so the board never shifts under a keypress.
@@ -669,7 +706,7 @@ RESENDABLE_ACTIONS = {
 def resend_blocked_reason(state):
     """Why a task's own state rules out a re-send. Phrased to follow "N tasks skipped — "."""
     if state in CLOSED_STATES:
-        return "already %s" % STATE_LABEL.get(state, state)
+        return "already %s" % state
     return "the Source has it now"
 
 def resend_tasks(ids, statuses, tabs=None):
@@ -750,6 +787,9 @@ def ui(_):
             if mode == "confirm_delete":
                 message = ("Delete %d selected task%s?   [y/N]"
                            % (len(pending), "" if len(pending) == 1 else "s"), ("red",))
+            elif mode == "confirm_daemon":
+                message = ("Stop the daemon?   [y/N]" if daemon_running()
+                           else "Start the daemon?   [y/N]", ("red",))
             elif flash: message = (flash[0], ("yellow",))
             else: message = None
             frame = render_board(width, selected, cursor, statuses, items,
@@ -759,6 +799,11 @@ def ui(_):
 
             key = _read_key(1.0)
             if key is None: continue
+            if mode == "confirm_daemon":
+                if key in ("y","Y","\r","\n"): flash = (toggle_daemon(), time.time()+4)
+                else: flash = ("Daemon unchanged", time.time()+2)
+                mode = None
+                continue
             if mode == "confirm_delete":
                 if key in ("y","Y","\r","\n"):
                     c = conn()
@@ -791,7 +836,7 @@ def ui(_):
                 if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else: pending, mode = sorted(selected), "confirm_delete"
             elif key == "t":
-                flash = (toggle_daemon(), time.time()+3)
+                mode = "confirm_daemon"      # a stray keypress must not stop the service
     except KeyboardInterrupt:
         pass
     finally:

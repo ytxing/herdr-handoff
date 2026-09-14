@@ -1,8 +1,10 @@
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -122,6 +124,86 @@ class HandoffCliTests(HandoffTestBase):
                          "the delivery was captured by the stub instead of reaching herdr")
         self.assertIn("HANDOFF RESULT READY", self.prompt_log.read_text(),
                       "and it is a real handoff notification, not a test-local stub of one")
+
+
+class DaemonLifecycleTests(HandoffTestBase):
+    """Uniqueness must not rest on a file that outlives the process it describes."""
+
+    def start_daemon(self):
+        p = subprocess.Popen([sys.executable, str(ROOT / "handoff.py"), "daemon", "start"],
+                             env=dict(os.environ, HANDOFF_STATE_DIR=self.tmp.name),
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(50):
+            if self.handoff.daemon_running(): return p
+            time.sleep(0.1)
+        p.kill(); self.fail("daemon never took the lock")
+
+    def tearDown(self):
+        if self.handoff.daemon_running():
+            (Path(self.tmp.name) / "daemon.stop").touch()
+            for _ in range(80):
+                if not self.handoff.daemon_running(): break
+                time.sleep(0.1)
+        super().tearDown()
+
+    def test_a_second_daemon_is_refused(self):
+        p = self.start_daemon()
+        try:
+            second = self.run_cli("daemon", "start")
+            self.assertNotEqual(second.returncode, 0, "a second daemon must not be allowed")
+            self.assertIn("already running", second.stderr)
+        finally:
+            p.kill()
+
+    def test_status_agrees_with_the_board(self):
+        """The CLI used to answer from the mere existence of the pid file, so the two disagreed."""
+        self.assertEqual(self.run_cli("daemon", "status").stdout.strip(), "stopped")
+        self.assertFalse(self.handoff.daemon_running())
+        p = self.start_daemon()
+        try:
+            self.assertEqual(self.run_cli("daemon", "status").stdout.strip(), "running")
+            self.assertTrue(self.handoff.daemon_running())
+        finally:
+            p.kill()
+
+    def test_a_killed_daemon_does_not_read_as_running(self):
+        """The reported bug: SIGKILL left a pid file naming a process that no longer existed.
+
+        The pid file outlives whatever wrote it, so nothing in user space can tell a stale one
+        from a live daemon. The lock is released by the kernel on death, so it can.
+        """
+        p = self.start_daemon()
+        self.assertEqual(int((Path(self.tmp.name) / "daemon.pid").read_text()), p.pid)
+        os.kill(p.pid, signal.SIGKILL); p.wait()
+        for _ in range(30):
+            if not self.handoff.daemon_running(): break
+            time.sleep(0.1)
+        self.assertFalse(self.handoff.daemon_running(), "a killed daemon must not read as running")
+        self.assertEqual(self.run_cli("daemon", "status").stdout.strip(), "stopped",
+                         "and `daemon status` must agree with the board")
+
+    def test_a_new_daemon_can_take_over_at_once(self):
+        p = self.start_daemon()
+        os.kill(p.pid, signal.SIGKILL); p.wait()
+        for _ in range(30):
+            if not self.handoff.daemon_running(): break
+            time.sleep(0.1)
+        q = self.start_daemon()               # no wait, no manual cleanup of a stale file
+        try:
+            self.assertEqual(int((Path(self.tmp.name) / "daemon.pid").read_text()), q.pid,
+                             "the pid file now names the daemon that is actually running")
+        finally:
+            q.kill()
+
+    def test_stop_reports_whether_it_actually_stopped(self):
+        self.assertEqual(self.run_cli("daemon", "stop").stdout.strip(), "no daemon is running")
+        p = self.start_daemon()
+        result = self.run_cli("daemon", "stop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("daemon stopped", result.stdout)
+        self.assertFalse(self.handoff.daemon_running())
+        p.wait()
 
 
 class BoardRenderTests(HandoffTestBase):

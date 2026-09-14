@@ -57,7 +57,7 @@ A 领取并验收：
 | `r` | 向勾选任务的 Target 重发已存 prompt |
 | `d` | 删除勾选任务（先弹确认） |
 | `y` / `Enter` | 确认删除；其他任意键取消 |
-| `t` | 启动 / 停止 daemon |
+| `t` | 启动 / 停止 daemon（先二次确认） |
 | `q` / `Ctrl-C` | 退出 |
 
 `r` 只重发仍处于 `published` 或 `active` 的任务，且只投给 Herdr 状态为 `idle` 或 `done` 的 Target。其余一律跳过，原因列在提示条**上方单独一行**——提示不会盖住快捷键条。Herdr 本身不会拒绝向忙碌的 agent 投递 prompt，所以这道判断由看板负责，没有它就会打断正在进行的任务。重发的文本头部是 `[HANDOFF TASK — RE-SENT]` 并写明任务当前状态，让接收端能区分「催办」和「新任务」，不必自己去查记录、也不会把已交的活重做一遍。
@@ -73,6 +73,15 @@ SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 
 没有这道守卫时，一个老实照提醒词敲命令的 agent 会把已验收的任务复活成 `active`，重做一遍，`done` 覆盖掉已存结果，并再通知 Source 一次。
 
 `claim` / `accept` 刻意不在守卫范围内——它们的落点就是 `finished`，重复执行是幂等重试，不是复活。
+
+## daemon 的单实例保证
+
+靠一把文件锁（`daemon.lock`），不是靠 pid 文件。**pid 文件在持有者被 `kill -9` 后会留下一个指向已消失进程的记录，而用户态无法分辨它和活着的 daemon 有什么区别**——运行中的 daemon 就是这样被显示成 stopped 的。锁由内核在持有者死亡时释放，所以不存在这个问题；pid 文件保留，但只作给人看的便利信息。
+
+- `daemon start` 在已有 daemon 持锁时**拒绝启动**并报错，不会再出现两个 daemon 同时跑、互相重复投递
+- `daemon status` 与看板用**同一套判定**，不会再一个说 running 一个说 off
+- `daemon stop` 会等锁真正释放再回报（最多 6 秒），不是「信号已发出」就算完；没有 daemon 时明说 `no daemon is running`
+- 看板上按 `t` 会**先问一次**再执行
 
 ## 配置
 
