@@ -661,7 +661,10 @@ def toggle_daemon():
 
 # Only these states leave something for the Target to do. A finished task must not be
 # re-sent, and neither must one whose ball is already in the Source's court.
-RESENDABLE_STATES = ("published", "active")
+RESENDABLE_ACTIONS = {
+    "published": "take",
+    "active": "done",
+}
 
 def resend_blocked_reason(state):
     """Why a task's own state rules out a re-send. Phrased to follow "N tasks skipped — "."""
@@ -678,9 +681,20 @@ def resend_tasks(ids, statuses, tabs=None):
     sent, skipped, failed = [], [], []
     for row in rows:
         if not row: continue
-        if row["state"] not in RESENDABLE_STATES:      # only the Target's own outstanding work
+        if RESENDABLE_ACTIONS.get(row["state"]) != row["action"]:
             skipped.append((resend_blocked_reason(row["state"]), None))   # counted, not named
             continue
+        # State can change while the board is deciding what to resend.  Re-read immediately
+        # before delivery; an invalidated resend is discarded rather than replayed later.
+        fresh_conn = conn()
+        try:
+            fresh = fresh_conn.execute("select * from tasks where id=?", (row["id"],)).fetchone()
+        finally:
+            fresh_conn.close()
+        if not fresh or RESENDABLE_ACTIONS.get(fresh["state"]) != fresh["action"]:
+            skipped.append(("state changed", None))
+            continue
+        row = fresh
         entry = _lookup_status(statuses, None, row["target_pane"])
         who = live_label(entry, None, row["target_pane"], None)
         if entry is None or entry[0] not in READY_STATUSES:
