@@ -101,6 +101,31 @@ class HandoffCliTests(HandoffTestBase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("description", result.stderr)
 
+    def test_an_old_database_with_duplicates_still_opens(self):
+        """The index migration must not brick the tool over data it did not create.
+
+        A store written before the index existed can hold two open tasks for one Target;
+        refusing to open it would take the CLI, the daemon and the board down together.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            db = Path(d) / "handoff.sqlite3"          # conn() opens exactly this name
+            raw = sqlite3.connect(db)
+            raw.execute("create table tasks(id text primary key, description text not null,"
+                        " prompt text not null, source_pane text not null, target_pane text not null,"
+                        " state text not null, action text not null, state_since text not null)")
+            for tid in ("t_a", "t_b"):
+                raw.execute("insert into tasks values(?,?,?,?,?,?,?,?)",
+                            (tid, "旧数据", "p", "wA:pX", "wA:pSAME", "active", "done", "2026-01-01"))
+            raw.commit(); raw.close()
+            saved = self.handoff.ROOT, self.handoff.DB
+            self.handoff.ROOT, self.handoff.DB = Path(d), db
+            try:
+                c = self.handoff.conn()
+                self.assertEqual(c.execute("select count(*) from tasks").fetchone()[0], 2,
+                                 "the store must still open when the index cannot be created")
+            finally:
+                self.handoff.ROOT, self.handoff.DB = saved
+
     def test_delete_removes_task(self):
         result = self.run_cli("delete", "t_test")
         self.assertEqual(result.returncode, 0, result.stderr)

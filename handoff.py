@@ -30,9 +30,16 @@ def conn():
     # One open task per Target, enforced by the store rather than by a check that a concurrent
     # send can race past: two sends could both SELECT, both see nothing, and both INSERT.
     # A partial index makes the second insert fail instead of succeeding quietly.
-    c.execute("""create unique index if not exists one_open_task_per_target
-                 on tasks(target_pane) where state not in
-                 ('finished','rejected','cancelled','timeout','target_absent','source_absent')""")
+    try:
+        c.execute("""create unique index if not exists one_open_task_per_target
+                     on tasks(target_pane) where state not in
+                     ('finished','rejected','cancelled','timeout','target_absent','source_absent')""")
+    except sqlite3.IntegrityError:
+        # A database written before this index existed may already hold two open tasks for one
+        # Target. Refusing to open it would take the whole tool down -- CLI, daemon and board --
+        # over data it did not create, so the index is skipped and the SELECT in send() remains
+        # the only guard until the duplicates are cleared.
+        pass
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
     c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
