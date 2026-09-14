@@ -493,7 +493,9 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if routing == "route": return krt + 2
         return 0
     def fixed():
-        w = MARK_W + kid + kst + kag + 2*4 + routing_w()
+        # Seven cells are separated by six two-column gaps. Under-counting these gaps
+        # lets the description consume the right edge and clips the AGE column.
+        w = MARK_W + kid + kst + kag + 2*6 + routing_w()
         if show_action: w += knx + 2
         return w
     while width - fixed() < MIN_DESC:
