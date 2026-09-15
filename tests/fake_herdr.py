@@ -18,9 +18,20 @@ import os
 import sys
 import time
 
+def focused():
+    """Read focus from a FILE, not the environment.
+
+    A daemon's environment is frozen when it is spawned, so a test that wants focus to change
+    while the daemon runs has to vary something the daemon can still see.
+    """
+    path = os.environ.get("FAKE_HERDR_FOCUS_FILE")
+    return bool(path) and os.path.exists(path)
+
+
 AGENT = {"agent": "claude", "agent_status": os.environ.get("FAKE_HERDR_STATUS", "idle"), "pane_id": "wA:pTEST",
          "tab_id": "wA:tTEST", "workspace_id": "wA", "terminal_id": "term_test",
-         "name": "test-agent", "revision": 1, "state_change_seq": 1, "focused": False,
+         "name": "test-agent", "revision": 1, "state_change_seq": 1,
+         "focused": focused(),
          "interactive_ready": True}
 
 

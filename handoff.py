@@ -263,6 +263,7 @@ def daemon(a):
                     continue
                 ag = r[f"{recipient}_pane"]
                 info=agent_get(ag); lifecycle="unknown"; present="absent" if info is None else "present"
+                agent_info = {}
                 if info:
                     result = info.get("result", info) if isinstance(info,dict) else {}
                     agent_info = result.get("agent", result) if isinstance(result,dict) else {}
@@ -288,6 +289,13 @@ def daemon(a):
                         fresh["state"] in ("target_absent", "source_absent")):
                     continue
                 if fresh["state"] != r["state"] or fresh["action"] != r["action"]:
+                    continue
+                # The user is looking at this pane. A reminder would start a turn in the very
+                # window they are working in -- which is what pressing Escape undoes -- and they
+                # can see the pending state for themselves. Skipped without consuming a retry, so
+                # a task cannot age toward its timeout while they are sitting there; moving focus
+                # away resumes reminders on the next sweep.
+                if agent_info.get("focused"):
                     continue
                 if time.time() >= datetime.fromisoformat((r["next_prompt_at"] or now())).timestamp():
                     retries = r["retry_count"]

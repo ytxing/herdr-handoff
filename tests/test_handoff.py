@@ -347,6 +347,38 @@ class DaemonLifecycleTests(HandoffTestBase):
         finally:
             self.reap(q)
 
+    def test_a_reminder_holds_off_while_its_pane_has_the_users_focus(self):
+        """Nudging a pane the user is looking at is a loop: nudge, Escape, nudge.
+
+        Herdr reports the pane as focused, so the daemon can tell. It skips without spending a
+        retry -- otherwise a task would age toward its timeout while the user simply sits there
+        -- and reminders resume once focus moves away.
+        """
+        c = self.db()
+        c.execute(INSERT, ("t_nag", "待领取", "p", "wA:pTEST-SRC", "wA:pTEST-FOCUSED",
+                           "published", "take", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=? where id='t_nag'", (self.handoff.now(),))
+        c.commit()
+        focus_file = Path(self.tmp.name) / "focused"
+        os.environ["FAKE_HERDR_FOCUS_FILE"] = str(focus_file)
+        focus_file.touch()                     # the user is sitting in that pane
+        p = None
+        try:
+            p = self.start_daemon()
+            time.sleep(self.handoff.SWEEP_SECONDS * 2 + 1)
+            self.assertEqual(self.delivered(), [], "a focused pane must not be reminded")
+            self.assertEqual(
+                self.db().execute("select retry_count from tasks where id='t_nag'").fetchone()[0], 0,
+                "holding off must not spend a retry")
+
+            focus_file.unlink()                    # the user looks elsewhere
+            time.sleep(self.handoff.SWEEP_SECONDS * 2 + 1)
+            self.assertIn("wA:pTEST-FOCUSED", self.delivered(),
+                          "reminders resume once the pane is no longer focused")
+        finally:
+            os.environ.pop("FAKE_HERDR_FOCUS_FILE", None)
+            if p: self.reap(p)
+
     def test_stop_works_while_the_daemon_waits_on_a_busy_agent(self):
         """A review finding: an unbounded `herdr agent wait` parked the daemon.
 

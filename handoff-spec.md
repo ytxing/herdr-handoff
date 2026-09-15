@@ -230,6 +230,12 @@ B 忘记 `take` 时：
 
 A 忘记 `claim` 或 `accept` 时，使用 `protocol_ack_timeout` 提醒；结果持续保存在本地。
 
+**焦点抑制**：若待办一方所在的 pane 正处于用户焦点（Herdr `agent get` 的 `focused` 字段），本轮不发提醒也不消耗重试次数，等焦点移开后恢复。
+
+理由：Herdr 只按终端标题推断状态（`| Working` / `| Ready`），**用户按 Esc 打断后与正常结束回合无法区分**，daemon 拿不到「刚被打断」这个信号。而提醒会 `herdr agent prompt` 唤醒 agent 起一个回合——正是 Esc 要撤销的动作，形成「催—打断—再催」的循环。焦点是 Herdr 原生的、无需解析终端文本的信号，且用户就在该窗口里，待办状态肉眼可见。
+
+不使用逐行匹配 `■ Conversation interrupted` 之类的 UI 文本：那属于解析终端自然语言，且随 harness 措辞变化即失效。
+
 任务需要 Source 回答时不走单独的协议状态：B 以 `done` 交回、把问题写进结果文件，Source 决定是发新任务还是接受。
 
 ## Herdr 适配
