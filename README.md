@@ -68,11 +68,13 @@ SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 
 
 ## 完成态的任务不可再推进
 
-任何会把**已终结**任务（`finished`、`rejected`、`cancelled`、`timeout`、`*_absent`）拉回活动状态的命令都会被拒绝，返回非零退出码并说明当前状态。覆盖 `take`、`progress`、`done`、`done-implicit`、`reply`、`blocked`、`reject`。
+任何会把**已终结**任务（`finished`、`rejected`、`cancelled`、`timeout`、`*_absent`）拉回活动状态的命令都会被拒绝，返回非零退出码并说明当前状态。覆盖 `take`、`progress`、`done`、`done-implicit`、`reject`。
 
 没有这道守卫时，一个老实照提醒词敲命令的 agent 会把已验收的任务复活成 `active`，重做一遍，`done` 覆盖掉已存结果，并再通知 Source 一次。
 
 `claim` / `accept` 刻意不在守卫范围内——它们的落点就是 `finished`，重复执行是幂等重试，不是复活。
+
+`handoff cancel` **只改本地记录，不通知 Target、也不打断它**。范围调整时的做法是「取消旧任务 + 发一条收敛后的新任务」，不引入额外的取消协议。需要让 Target 立刻停下，由操作者手动执行 `herdr agent send-keys <target> esc`。
 
 ## daemon 的单实例保证
 

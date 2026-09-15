@@ -261,8 +261,19 @@ handoff daemon status
 任务控制：
 
 ```text
-handoff cancel <task-id>  # 永久取消
+handoff cancel <task-id>  # 永久取消（仅改本地记录）
 ```
+
+`cancel` **只标记本地任务记录，不通知 Target、也不打断它**。正在执行的 Target 会继续做完当前这一轮，做完后若去执行 `done` 会被终态守卫拒绝（任务已是 `cancelled`）。
+需要让 Target **立刻停下**时，由操作者手动打断：
+
+```sh
+herdr agent send-keys <target> esc      # esc 为规范键名，ctrl+c 亦可
+```
+
+## 范围变更的常规做法：cancel + 重发
+
+范围调整时不必引入「取消中」这类中间态，直接取消旧任务、发一条收敛后的新任务即可——新提示词天然覆盖旧意图，Target 无需理解任何取消协议。
 
 看板 `handoff ui` 读本地状态，可作为普通终端程序，也可由 Herdr pane 启动。看板不只是展示，也可以直接操作任务：勾选后删除、或向 Target 重发已存 prompt，并可开关 daemon。至少显示：
 
