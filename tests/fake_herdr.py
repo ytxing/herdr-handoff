@@ -58,6 +58,14 @@ def main(argv):
 
     if cmd[:2] == ["agent", "get"]:
         target = cmd[2] if len(cmd) > 2 else ""
+        # The real CLI answers an unknown name with {"error": ...} and a non-zero exit. A test
+        # that needs that answer names the value in FAKE_HERDR_ABSENT; every other name
+        # resolves, which keeps the fixtures readable.
+        if target in (os.environ.get("FAKE_HERDR_ABSENT") or "").split(","):
+            emit({"id": "cli:agent:get",
+                  "error": {"code": "agent_not_found",
+                            "message": "agent target %s not found" % target}})
+            return 1
         emit({"id": "cli:agent:get",
               "result": {"agent": dict(AGENT, pane_id=target), "type": "agent_info"}})
         return 0

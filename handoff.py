@@ -23,10 +23,26 @@ def conn():
     c.execute("""create table if not exists tasks(
       id text primary key, description text not null, prompt text not null,
       source_pane text not null, target_pane text not null, state text not null, action text not null,
-      state_since text not null, last_prompt_at text, next_prompt_at text,
+      state_since text not null, task_started_at text, previous_node_started_at text,
+      last_prompt_at text, next_prompt_at text,
       retry_count integer not null default 0, result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
       source_presence text, target_presence text)""")
+    # Add timing columns to stores created before the board showed task/node start times. They
+    # stay nullable for the ALTER TABLE path; new rows always fill task_started_at explicitly.
+    columns = {row[1] for row in c.execute("pragma table_info(tasks)")}
+    if "task_started_at" not in columns:
+        try: c.execute("alter table tasks add column task_started_at text")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error): raise
+    if "previous_node_started_at" not in columns:
+        try: c.execute("alter table tasks add column previous_node_started_at text")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error): raise
+    # A legacy row has no creation timestamp. Its first observed state is the closest truthful
+    # value, and makes the new column useful immediately after opening an old store.
+    c.execute("update tasks set task_started_at=state_since where task_started_at is null")
+    c.commit()
     # One open task per Target, enforced by the store rather than by a check that a concurrent
     # send can race past: two sends could both SELECT, both see nothing, and both INSERT.
     # A partial index makes the second insert fail instead of succeeding quietly.
@@ -42,8 +58,10 @@ def conn():
         pass
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
-    c.execute("update tasks set state=?,action=?,state_since=?,last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
-              (state,action,now(),last_action or action,now(),error,tid)); c.commit()
+    stamp = now()
+    c.execute("update tasks set state=?,action=?,previous_node_started_at=state_since,state_since=?,"
+              "last_action=?,last_action_at=?,error=?,retry_count=0 where id=?",
+              (state,action,stamp,last_action or action,stamp,error,tid)); c.commit()
 def herdr(*args, timeout=20):
     try:
         p=subprocess.run([os.environ.get("HERDR_BIN_PATH","herdr"),*args],text=True,capture_output=True,timeout=timeout)
@@ -61,6 +79,17 @@ def prompt(agent, text):
 def agent_get(agent): return herdr("agent","get",agent)
 
 def record_identity(c, row, a):
+    """Refresh one side's pane from whoever just ran a protocol command.
+
+    The pane is recorded only once Herdr confirms it resolves. An agent that cannot tell what
+    its own pane is has handed over a placeholder (`unknown`), and another handed over the
+    same id with its workspace prefix stripped (`p16`). Both went in unchecked; the second
+    stranded a live task, because the daemon addresses the Target by this value and every
+    later lookup found no such pane. Keeping the recorded pane when the new one does not
+    resolve costs nothing -- the row still points at a pane that existed, which beats one
+    that never did. The command itself still goes through: this is a repair, not a gate.
+    """
+    if agent_get(a.pane) is None: return
     side = "target" if row["action"] in ("take", "done") else "source"
     c.execute(f"update tasks set {side}_pane=? where id=?", (a.pane, row["id"]))
     c.commit()
@@ -147,9 +176,14 @@ def cmd_send(a):
     # Explicit source and target are required; validate when Herdr is available.
     if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
     if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")
+    started_at = now()
     try:
-        c.execute("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since,next_prompt_at,source_presence,target_presence) values(?,?,?,?,?,?,?,?,?,?,?)",
-          (tid,a.description,a.prompt,a.source_pane,a.target_pane,"published","take",now(),datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),"present","present"))
+        c.execute("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since,"
+                  "task_started_at,previous_node_started_at,next_prompt_at,source_presence,target_presence) "
+                  "values(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+          (tid,a.description,a.prompt,a.source_pane,a.target_pane,"published","take",started_at,
+           started_at,None,datetime.fromtimestamp(time.time()+PROTOCOL_ACK_TIMEOUT,timezone.utc).isoformat(),
+           "present","present"))
         c.commit()
     except sqlite3.IntegrityError:
         # The partial unique index turned the check above into something a concurrent send
@@ -396,6 +430,15 @@ def _human_age(sec):
     if sec < 86400: return "%dh%02dm" % (sec // 3600, sec % 3600 // 60)
     return "%dd%02dh" % (sec // 86400, sec % 86400 // 3600)
 
+def _display_time(value):
+    """Use a compact local timestamp that fits beside the board's operational columns."""
+    if not value: return "—"
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone().strftime("%m-%d %H:%M")
+    except (TypeError, ValueError, OverflowError):
+        return _fit(str(value), 11)
+
 STATUS_STYLE = {"idle":("green",), "done":("green",), "working":("yellow",),
                 "blocked":("red",), "unknown":("dim",)}
 # Herdr reports `idle` and `done` alike as "ready for input"; both count as safe to prompt.
@@ -563,6 +606,8 @@ def board_items():
             "closed": r["state"] in CLOSED_STATES,
             "age": _human_age(time.time() - datetime.fromisoformat(r["state_since"]).timestamp()),
             "since": r["state_since"],
+            "task_start": _display_time(r["task_started_at"] or r["state_since"]),
+            "previous_node_start": _display_time(r["previous_node_started_at"]),
         })
     # live tasks first, finished ones sink to the bottom
     items.sort(key=lambda x: (x["closed"], x["since"]))
@@ -605,6 +650,13 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         # The action determines which side must act. Agent names are runtime metadata and
         # are intentionally absent from the task record, so never compare stored names here.
         i["actor_label"] = i["dst_label"] if i["action"] in ("take", "done") else i["src_label"]
+        # Keep render_board useful with hand-built items in callers and with rows from an older
+        # store that only has state_since. conn() backfills the database value, but this fallback
+        # keeps the renderer's contract independent of that migration detail.
+        i["task_start"] = i.get("task_start") or _display_time(
+            i.get("task_started_at") or i.get("since"))
+        i["previous_node_start"] = i.get("previous_node_start") or _display_time(
+            i.get("previous_node_started_at"))
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
@@ -627,6 +679,8 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     krt = widest("ROUTE", [i["route"] for i in items])
     ksn = widest("SRC", [name_of(i,"src") for i in items])
     kdn = widest("DST", [name_of(i,"dst") for i in items])
+    kts = widest("START", [i["task_start"] for i in items])
+    kpn = widest("PREV", [i["previous_node_start"] for i in items])
 
     def status_cell(i, which, dim):
         """(plain, segments) for one SRC/DST cell.
@@ -651,25 +705,34 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     ksf = widest("SRC", [status_cell(i,"src",False)[0] for i in items])
     kdf = widest("DST", [status_cell(i,"dst",False)[0] for i in items])
 
-    # Narrowing ladder: full status columns, then names only, then one ROUTE column, then drop NEXT.
+    # Narrowing ladder: keep the operational columns visible first, then drop routing, action,
+    # and finally the two timestamps. Every removed optional column is accounted for by fixed(),
+    # so the description never consumes space reserved by a column on the right.
     routing, show_action = "full", True
+    show_task_start, show_previous_node_start = True, True
     MIN_DESC = 12
     def routing_w():
-        if routing == "full":  return ksf + 2 + kdf + 2
-        if routing == "names": return ksn + 2 + kdn + 2
-        if routing == "route": return krt + 2
+        if routing == "full":  return ksf + kdf
+        if routing == "names": return ksn + kdn
+        if routing == "route": return krt
         return 0
+    def routing_count():
+        if routing in ("full", "names"): return 2
+        return 1 if routing == "route" else 0
     def fixed():
-        # Seven cells are separated by six two-column gaps. Under-counting these gaps
-        # lets the description consume the right edge and clips the AGE column.
-        w = MARK_W + kid + kst + kag + 2*6 + routing_w()
-        if show_action: w += knx + 2
-        return w
+        widths = MARK_W + kid + kst + kag + routing_w()
+        count = 5 + routing_count()       # MARK, ID, DESCRIPTION, STATE, AGE
+        if show_action: widths += knx; count += 1
+        if show_task_start: widths += kts; count += 1
+        if show_previous_node_start: widths += kpn; count += 1
+        return widths + 2 * (count - 1)
     while width - fixed() < MIN_DESC:
         if routing == "full": routing = "names"
         elif routing == "names": routing = "route"
         elif show_action: show_action = False
         elif routing == "route": routing = "none"
+        elif show_previous_node_start: show_previous_node_start = False
+        elif show_task_start: show_task_start = False
         else: break
     desc_w = max(4, width - fixed())
 
@@ -677,9 +740,11 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         """Each cell is (text_or_segments, styles, width, align); last cell is not padded.
 
         `bg` is applied to every cell and to the separators between them. Wrapping the finished
-        line in a background would not survive: every cell ends with its own reset.
+        line in a background would not survive: every cell ends with its own reset. A highlighted
+        row gets trailing background-filled cells so its highlight reaches the board edge.
         """
         parts = []
+        visible = 0
         for idx, (text, styles, w, align) in enumerate(cells):
             if isinstance(text,(list,tuple)):
                 segs = list(text)
@@ -690,7 +755,11 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
                 gap = max(0, w - _dw("".join(s for s,_ in segs)))
                 segs = ([(" "*gap, ())] + segs) if align == "r" else (segs + [(" "*gap, ())])
             parts.append("".join(_paint(s, *(tuple(bg) + tuple(st))) for s, st in segs))
-        return _paint("  ", *bg).join(parts).rstrip()
+            visible += _dw("".join(s for s,_ in segs)) + (2 if idx else 0)
+        rendered = _paint("  ", *bg).join(parts)
+        if bg:
+            return rendered + _paint(" " * max(0, width - visible), *bg)
+        return rendered.rstrip()
 
     def routing_cells(i, dim, header):
         if header:
@@ -704,12 +773,15 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if routing == "route": return [(i["route"], dim, krt, "l")]
         return []
 
-    def assemble(mark, _id, desc, state, nxt, age, ms, ds, ss, ns, as_, i=None, header=False, bg=()):
+    def assemble(mark, _id, desc, state, nxt, age, task_start, previous_node_start,
+                 ms, ds, ss, ns, as_, ts, ps, i=None, header=False, bg=()):
         cells = [(mark, ms, MARK_W, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
         cells += routing_cells(i, ds, header)
         cells.append((state, ss, kst, "l"))
         if show_action: cells.append((nxt, ns, knx, "l"))
         cells.append((age, as_, kag, "r"))
+        if show_task_start: cells.append((task_start, ts, kts, "l"))
+        if show_previous_node_start: cells.append((previous_node_start, ps, kpn, "l"))
         return row(cells, bg)
 
     n = len(items)
@@ -736,9 +808,11 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
              + " " * max(1, width - used - len(clock)) + _paint(clock, "dim"),
              _paint("─" * max(1, width), "dim")]
     lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "ACTION", "AGE",
-                          ("dim",), ("dim",), ("dim",), ("dim",), ("dim",), header=True))
+                          "START", "PREV",
+                          ("dim",), ("dim",), ("dim",), ("dim",), ("dim",),
+                          ("dim",), ("dim",), header=True))
     if not items:
-        lines.append(_paint("  No tasks yet — create one with: handoff send", ("dim",)))
+        lines.append(_paint(_fit("  No tasks yet — create one with: handoff send", width), ("dim",)))
     for idx, i in enumerate(window):
         here = start + idx == cursor
         ds = ("dim",) if i["closed"] else ()
@@ -749,8 +823,9 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         ms = ("cyan",) if here else (("yellow",) if i["mine"] else ds)
         bg = ("bg_cursor",) if here else (("bg_picked",) if picked else ())
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
-                              i["state"], nxt, i["age"],
-                              ms, ds, STATE_STYLE.get(i["state"], ()), ns, ds, i=i, bg=bg))
+                              i["state"], nxt, i["age"], i["task_start"],
+                              i["previous_node_start"], ms, ds,
+                              STATE_STYLE.get(i["state"], ()), ns, ds, ds, ds, i=i, bg=bg))
     # The last two lines are fixed furniture: the message line, then the key legend.
     # The message line is reserved even when empty so the board never shifts under a keypress.
     lines.append("")
@@ -771,9 +846,11 @@ def terminal_size(fallback=(110, 30)):
     """
     try:
         size = os.get_terminal_size(sys.stdout.fileno())
-        return size.columns, size.lines
+        # The final physical cell is a wrap boundary on common terminals. Leaving it unused
+        # prevents a full-width timestamp or clock from losing its last character at the pane edge.
+        return max(1, size.columns - 1), size.lines
     except (OSError, ValueError):
-        return fallback
+        return max(1, fallback[0] - 1), fallback[1]
 
 def frame_bytes(frame):
     """Encode a frame for the terminal, erasing each line's tail as it is written.
@@ -782,7 +859,7 @@ def frame_bytes(frame):
     writing text does not clear the rest of the line, and a trailing \\033[J only clears below
     the cursor, which by then sits on the last line.
     """
-    return "\033[H" + "\033[K\n".join(frame.split("\n")) + "\033[K\033[J"
+    return "\033[H" + "\033[K\r\n".join(frame.split("\n")) + "\033[K\033[J"
 
 def _read_key(timeout):
     """Return a key name ("UP"/"DOWN"/"ESC"), a literal character, or None on timeout.

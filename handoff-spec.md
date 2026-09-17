@@ -23,11 +23,13 @@ Herdr 负责 Agent、pane、状态查询和 Prompt 投递；handoff 负责任务
 - 完整 `prompt` 或其文件路径；
 - `source`、`target` Agent 信息；
 - `state`、`required_action`；
-- `state_since`、`last_prompt_at`、`next_prompt_at`、`retry_count`；
+- `task_started_at`、`state_since`、`previous_node_started_at`、`last_prompt_at`、`next_prompt_at`、`retry_count`；
 - `result_file`；
 - `last_action`、`last_action_at`、`error`。
 
-任务在 `send` 成功登记并成功投递后直接进入 `published`。不单独保存 `created`。
+任务在 `send` 成功登记并成功投递后直接进入 `published`。`task_started_at` 在登记时固定；每次进入新状态时，
+将进入当前状态前的 `state_since` 保存为 `previous_node_started_at`。旧数据库没有任务开始时间时，迁移使用其
+现有的 `state_since` 作为回填值。
 
 ## 状态
 
@@ -290,6 +292,8 @@ Source Agent / Pane
 Target Agent / Pane
 Current State
 Required Action
+Task Start
+Previous Node Start
 State Since
 State Duration
 Herdr Presence / Lifecycle
@@ -299,6 +303,9 @@ Last Error
 ```
 
 `State Duration = now - state_since`，不需要持久化。
+
+看板中的 `START` 是任务登记时间，`PREV` 是进入当前状态前一个节点的开始时间；时间列使用紧凑的
+`MM-DD HH:MM` 本地时间格式。窗口变窄时看板会依次收起路由、操作和时间列，保证表头与任务行不超出终端宽度。
 
 ## 第一条验收路径
 

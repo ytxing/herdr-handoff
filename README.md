@@ -62,7 +62,7 @@ A 领取并验收：
 
 `r` 只重发仍处于 `published` 或 `active` 的任务，且只投给 Herdr 状态为 `idle` 或 `done` 的 Target。其余一律跳过，原因列在提示条**上方单独一行**——提示不会盖住快捷键条。Herdr 本身不会拒绝向忙碌的 agent 投递 prompt，所以这道判断由看板负责，没有它就会打断正在进行的任务。重发的文本头部是 `[HANDOFF TASK — RE-SENT]` 并写明任务当前状态，让接收端能区分「催办」和「新任务」，不必自己去查记录、也不会把已交的活重做一遍。
 
-SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 覆盖全部 agent），不依赖 daemon 是否在运行。终端过窄时这两列会按阶梯收缩，到 43 列左右会先放弃路由再放弃 ACTION，再窄就只能换 `handoff list` 了。这个下限来自 DESCRIPTION 的 4 列保底宽度，会随状态标签与 AGE 的显示宽度浮动。
+SRC/DST 两列的状态是向 Herdr 实时查询的（一次 `herdr agent list` 覆盖全部 agent），不依赖 daemon 是否在运行。看板还显示 `START` 和 `PREV` 两列，分别表示任务登记时间和当前状态前一个节点的开始时间。时间使用 `MM-DD HH:MM` 本地格式。终端过窄时各列会按阶梯收缩，始终保证表头和任务行不超出终端宽度。
 
 `ACTION` 列是「下一步该谁敲哪条命令」：`take · h2` 表示等 h2 执行 `take`，`▶ accept` 表示轮到你执行 `accept`（`▶` 是拿你所在 pane 与任务的 source/target pane 比对得出的），`—` 表示任务已终结。这是读看板时最该先看的一列——handoff 的状态机只在有人执行显式命令时才前进。
 

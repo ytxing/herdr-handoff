@@ -94,6 +94,65 @@ class HandoffCliTests(HandoffTestBase):
             row = self.db().execute("select state from tasks where id='t_test'").fetchone()
             self.assertEqual(row[0], expected)
 
+    def test_task_and_previous_node_start_times_follow_state_flow(self):
+        """The task clock stays fixed while each transition records the node it left."""
+        before = self.db().execute(
+            "select state_since,task_started_at,previous_node_started_at from tasks where id='t_test'").fetchone()
+        self.assertEqual(before["task_started_at"], before["state_since"])
+        self.assertIsNone(before["previous_node_started_at"])
+
+        result = self.run_cli("take", "t_test", "--pane", "wA:pTEST-DST")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.db().execute(
+            "select state_since,task_started_at,previous_node_started_at from tasks where id='t_test'").fetchone()
+        self.assertEqual(after["task_started_at"], before["task_started_at"])
+        self.assertEqual(after["previous_node_started_at"], before["state_since"])
+        self.assertNotEqual(after["state_since"], before["state_since"])
+
+    def test_send_records_a_fixed_task_start_time(self):
+        result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
+                              "--target-pane", "wA:pTEST-NEW", "--description", "new",
+                              "--prompt", "work")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = self.db().execute(
+            "select state_since,task_started_at,previous_node_started_at from tasks where id=?",
+            (result.stdout.strip(),)).fetchone()
+        self.assertEqual(row["task_started_at"], row["state_since"])
+        self.assertIsNone(row["previous_node_started_at"])
+
+    def test_an_unresolvable_pane_never_overwrites_a_recorded_one(self):
+        """A pane Herdr cannot resolve must not replace one that resolves.
+
+        2026-09-15, twice in one afternoon. An agent that could not name its own pane passed a
+        placeholder (`unknown`); an earlier one passed the same id with its workspace prefix
+        stripped (`p16`). record_identity wrote both in unchecked -- the only writer of these
+        columns that trusted its input. The `p16` one stranded a live task: the daemon
+        addresses the Target by this value, so every later lookup found no such pane and the
+        task was closed as target_absent with its request never delivered.
+
+        The command itself must still go through. Refusing the pane is a repair to the record,
+        not a gate on the protocol: an agent with a garbled pane id is still an agent that
+        just took the task.
+        """
+        os.environ["FAKE_HERDR_ABSENT"] = "unknown,p16,bogus"
+        try:
+            result_file = Path(self.tmp.name) / "r.md"
+            result_file.write_text("ok")
+            for command in (("take", "t_test", "--pane", "unknown"),
+                            ("done", "t_test", "--result-file", str(result_file), "--pane", "p16"),
+                            ("claim", "t_test", "--pane", "bogus")):
+                result = self.run_cli(*command)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.environ.pop("FAKE_HERDR_ABSENT", None)
+        row = self.db().execute("select * from tasks where id='t_test'").fetchone()
+        self.assertEqual(row["target_pane"], "wA:pTEST-DST",
+                         "an unresolvable Target pane must not replace the recorded one")
+        self.assertEqual(row["source_pane"], "wA:pTEST-SRC",
+                         "an unresolvable Source pane must not replace the recorded one")
+        self.assertEqual(row["state"], "finished",
+                         "the guard must not block the protocol itself")
+
     def test_empty_description_rejected_by_parser(self):
         result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
                               "--target-pane", "wA:pTEST-DST",
@@ -123,6 +182,11 @@ class HandoffCliTests(HandoffTestBase):
                 c = self.handoff.conn()
                 self.assertEqual(c.execute("select count(*) from tasks").fetchone()[0], 2,
                                  "the store must still open when the index cannot be created")
+                columns = {row[1] for row in c.execute("pragma table_info(tasks)")}
+                self.assertIn("task_started_at", columns)
+                self.assertIn("previous_node_started_at", columns)
+                self.assertEqual(c.execute("select task_started_at from tasks where id='t_a'").fetchone()[0],
+                                 "2026-01-01")
             finally:
                 self.handoff.ROOT, self.handoff.DB = saved
 
@@ -503,11 +567,30 @@ class BoardRenderTests(HandoffTestBase):
         return self.handoff.render_board(width, statuses=self.statuses, tabs=self.tabs,
                                          items=self.handoff.board_items(), **kw)
 
+    def test_terminal_size_leaves_a_safe_right_edge_for_the_board(self):
+        """The last physical terminal cell can clip or wrap a timestamp at the pane edge."""
+        class Size:
+            columns, lines = 80, 20
+
+        get_size = self.handoff.os.get_terminal_size
+        self.handoff.os.get_terminal_size = lambda fd: Size()
+        try:
+            self.assertEqual(self.handoff.terminal_size(), (79, 20))
+        finally:
+            self.handoff.os.get_terminal_size = get_size
+
     def test_no_line_ever_exceeds_the_requested_width(self):
         for width in range(43, 161):
             for line in self.board(width, selected={"t_bbbb333344"}, cursor=1).split("\n"):
                 self.assertLessEqual(self.handoff._dw(line), width,
                                      "width=%d produced %r" % (width, line))
+
+    def test_empty_board_also_respects_the_requested_width(self):
+        for width in range(43, 161):
+            lines = self.handoff.render_board(width, statuses=self.statuses, tabs={}, items=[]).split("\n")
+            for line in lines:
+                self.assertLessEqual(self.handoff._dw(line), width,
+                                     "empty board width=%d produced %r" % (width, line))
 
     def test_the_cursor_and_checked_rows_carry_a_background(self):
         """Whole-row highlight, not just the marker character.
@@ -527,6 +610,18 @@ class BoardRenderTests(HandoffTestBase):
                       "a checked row is backgrounded, at the weaker shade")
         self.assertNotIn("\033[48;5;", row_of("t_cccc555566"),
                          "an untouched row stays plain")
+
+    def test_cursor_background_reaches_the_right_edge(self):
+        """The cursor highlight fills the row's trailing empty cells too."""
+        self.handoff._ANSI_ON = True
+        try:
+            row = [line for line in self.board(150, cursor=1).splitlines()
+                   if "t_bbbb333344" in line][0]
+        finally:
+            self.handoff._ANSI_ON = False
+        plain = re.sub(r"\033\[[0-9;]*m", "", row)
+        self.assertEqual(self.handoff._dw(plain), 150)
+        self.assertRegex(row, r"\033\[48;5;238m +\033\[0m$")
 
     def test_checkbox_and_cursor_render_on_the_right_rows(self):
         lines = self.board(130, selected={"t_bbbb333344"}, cursor=1).split("\n")
@@ -650,6 +745,8 @@ class BoardRenderTests(HandoffTestBase):
         self.assertTrue(out.startswith("\033[H"))
         for line in ("aa", "bb", "cc"):
             self.assertIn(line + "\033[K", out, "each line must erase its own tail")
+        self.assertIn("aa\033[K\r\nbb", out,
+                      "each line must return to column zero even when tty newline conversion is off")
         self.assertTrue(out.endswith("\033[K\033[J"))
 
     def test_last_two_lines_are_reserved(self):
@@ -663,10 +760,31 @@ class BoardRenderTests(HandoffTestBase):
         header = lambda w: self.board(w).split("\n")[2]
         self.assertIn("SRC", header(150))
         self.assertIn("DST", header(150))
+        self.assertIn("START", header(150))
+        self.assertIn("PREV", header(150))
+        self.assertNotIn("TASK START", header(150))
+        self.assertNotIn("PREV NODE", header(150))
         self.assertTrue(any("ROUTE" in header(w) for w in range(150, 42, -1)),
                         "ROUTE must appear as the fallback before routing is dropped entirely")
         self.assertNotIn("working", self.board(43), "status words are the first thing dropped")
         self.assertNotIn("ROUTE", header(43))
+        self.assertNotIn("START", header(43))
+        self.assertNotIn("PREV", header(43))
+
+    def test_board_shows_the_task_and_previous_node_start(self):
+        task_start = "2026-09-16T08:09:00+00:00"
+        previous_start = "2026-09-16T08:10:00+00:00"
+        c = self.db()
+        c.execute("update tasks set task_started_at=?,previous_node_started_at=? where id=?",
+                  (task_start, previous_start, "t_bbbb333344"))
+        c.commit()
+        frame = self.board(150)
+        header, row = frame.splitlines()[2], [line for line in frame.splitlines()
+                                              if "t_bbbb333344" in line][0]
+        self.assertIn("START", header)
+        self.assertIn("PREV", header)
+        self.assertIn(self.handoff._display_time(task_start), row)
+        self.assertIn(self.handoff._display_time(previous_start), row)
 
     def test_cjk_measures_as_two_columns(self):
         dw, fit = self.handoff._dw, self.handoff._fit
