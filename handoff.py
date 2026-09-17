@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Small, dependency-free Herdr handoff coordinator."""
-import argparse, fcntl, json, os, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
+import argparse, fcntl, json, os, re, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -375,7 +375,7 @@ ACTION_LABEL = {"take":"take","done":"done","claim":"claim","accept":"accept","n
 _CODES = {"dim":"2","red":"31","green":"32","yellow":"33","blue":"34","magenta":"35","cyan":"36",
           # Row backgrounds. The cursor row is the brighter of the two; a row that is both is
           # shown as the cursor, since that is what the next keypress will act on.
-          "bg_cursor":"48;5;238", "bg_picked":"48;5;235"}
+          "bg_cursor":"48;5;238", "bg_picked":"48;5;235", "scroll_thumb":"90"}
 _ANSI_ON = False
 
 def _use_color():
@@ -389,6 +389,8 @@ def _cw(ch):
     return 2 if unicodedata.east_asian_width(ch) in ("W","F") else 1
 
 def _dw(s): return sum(_cw(ch) for ch in s)
+
+def _visible_dw(s): return _dw(re.sub(r"\033\[[0-9;]*m", "", s))
 
 def _fit(s, width):
     if width <= 0: return ""
@@ -595,6 +597,17 @@ def board_items():
         action = r["action"]; to_target = action in ("take","done")
         actor = r["target_pane"] if to_target else r["source_pane"]
         actor_pane = r["target_pane"] if to_target else r["source_pane"]
+        task_started_at = r["task_started_at"] or r["state_since"]
+        previous_node_started_at = r["previous_node_started_at"] or task_started_at
+        node_started_at = r["state_since"] or task_started_at
+        state_started_at = datetime.fromisoformat(r["state_since"])
+        if r["state"] in CLOSED_STATES:
+            # A terminal row is no longer active, so its state duration ends at the transition
+            # that closed it. Legacy rows without last_action_at use state_since and show 0s.
+            age_end = datetime.fromisoformat(r["last_action_at"] or r["state_since"])
+            age_seconds = age_end.timestamp() - state_started_at.timestamp()
+        else:
+            age_seconds = time.time() - state_started_at.timestamp()
         items.append({
             "id": r["id"], "desc": r["description"].replace("\n"," / "),
             "src_agent": "", "src_pane": r["source_pane"],
@@ -604,13 +617,15 @@ def board_items():
             "mine": (bool(me) and actor_pane == me and action != "none"
                      and r["state"] not in CLOSED_STATES),
             "closed": r["state"] in CLOSED_STATES,
-            "age": _human_age(time.time() - datetime.fromisoformat(r["state_since"]).timestamp()),
-            "since": r["state_since"],
-            "task_start": _display_time(r["task_started_at"] or r["state_since"]),
-            "previous_node_start": _display_time(r["previous_node_started_at"]),
+            "age": _human_age(age_seconds),
+            "since": node_started_at,
+            "task_start": _display_time(task_started_at),
+            "previous_node_start": _display_time(previous_node_started_at),
         })
-    # live tasks first, finished ones sink to the bottom
-    items.sort(key=lambda x: (x["closed"], x["since"]))
+    # Active tasks come first. Within each group, the task whose current node started most
+    # recently comes first, so the board's top rows reflect the latest activity.
+    items.sort(key=lambda x: x["since"], reverse=True)
+    items.sort(key=lambda x: x["closed"])
     return items
 
 MARK_W = 4          # cursor glyph + "[x]" checkbox
@@ -634,6 +649,9 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     if statuses is None: statuses = agent_statuses()
     if items is None: items = board_items()
     if tabs is None: tabs = pane_tabs()
+    frame_width = max(1, width)
+    scrollbar_width = 1 if frame_width > 1 and items else 0
+    content_width = frame_width - scrollbar_width
     for i in items:
         i["src_status"] = _lookup_status(statuses, i["src_agent"], i["src_pane"])
         i["dst_status"] = _lookup_status(statuses, i["dst_agent"], i["dst_pane"])
@@ -653,10 +671,10 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         # Keep render_board useful with hand-built items in callers and with rows from an older
         # store that only has state_since. conn() backfills the database value, but this fallback
         # keeps the renderer's contract independent of that migration detail.
-        i["task_start"] = i.get("task_start") or _display_time(
-            i.get("task_started_at") or i.get("since"))
+        task_started_at = i.get("task_started_at") or i.get("since")
+        i["task_start"] = i.get("task_start") or _display_time(task_started_at)
         i["previous_node_start"] = i.get("previous_node_start") or _display_time(
-            i.get("previous_node_started_at"))
+            i.get("previous_node_started_at") or task_started_at)
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
@@ -726,7 +744,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if show_task_start: widths += kts; count += 1
         if show_previous_node_start: widths += kpn; count += 1
         return widths + 2 * (count - 1)
-    while width - fixed() < MIN_DESC:
+    while content_width - fixed() < MIN_DESC:
         if routing == "full": routing = "names"
         elif routing == "names": routing = "route"
         elif show_action: show_action = False
@@ -734,7 +752,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         elif show_previous_node_start: show_previous_node_start = False
         elif show_task_start: show_task_start = False
         else: break
-    desc_w = max(4, width - fixed())
+    desc_w = max(1, content_width - fixed())
 
     def row(cells, bg=()):
         """Each cell is (text_or_segments, styles, width, align); last cell is not padded.
@@ -758,7 +776,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
             visible += _dw("".join(s for s,_ in segs)) + (2 if idx else 0)
         rendered = _paint("  ", *bg).join(parts)
         if bg:
-            return rendered + _paint(" " * max(0, width - visible), *bg)
+            return rendered + _paint(" " * max(0, content_width - visible), *bg)
         return rendered.rstrip()
 
     def routing_cells(i, dim, header):
@@ -793,6 +811,22 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if len(items) > room:
             start = max(0, min((cursor or 0) - room + 1, len(items) - room))
             window = items[start:start + room]
+
+    def scrollbar_slots(total, visible, offset):
+        if not total or not visible: return []
+        if total <= visible:
+            return [("│", ("dim",))] * visible
+        thumb = max(1, (visible * visible + total - 1) // total)
+        travel = visible - thumb
+        maximum_offset = total - visible
+        thumb_start = (offset * travel + maximum_offset // 2) // maximum_offset
+        slots = [("│", ("dim",))] * visible
+        for idx in range(thumb_start, thumb_start + thumb):
+            slots[idx] = ("█", ("scroll_thumb",))
+        return slots
+
+    scroll_slots = scrollbar_slots(n, len(window), start)
+    row_backgrounds = []
     awaiting = sum(1 for i in items if i["mine"] and not i["closed"])
     daemon_on = daemon_running()
     # Header is built from segments so it can be truncated instead of overrunning a narrow pane.
@@ -803,16 +837,16 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     segs += [(" · daemon ", ("dim",)),
              ("on" if daemon_on else "off", ("green",) if daemon_on else ("dim",))]
     clock = datetime.now().strftime("%H:%M:%S")
-    head, used = _fit_segments(segs, max(0, width - len(clock) - 1))
+    head, used = _fit_segments(segs, max(0, content_width - len(clock) - 1))
     lines = ["".join(_paint(t, *s) for t, s in head)
-             + " " * max(1, width - used - len(clock)) + _paint(clock, "dim"),
-             _paint("─" * max(1, width), "dim")]
+             + " " * max(1, content_width - used - len(clock)) + _paint(clock, "dim"),
+             _paint("─" * max(1, content_width), "dim")]
     lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "ACTION", "AGE",
                           "START", "PREV",
                           ("dim",), ("dim",), ("dim",), ("dim",), ("dim",),
                           ("dim",), ("dim",), header=True))
     if not items:
-        lines.append(_paint(_fit("  No tasks yet — create one with: handoff send", width), ("dim",)))
+        lines.append(_paint(_fit("  No tasks yet — create one with: handoff send", frame_width), ("dim",)))
     for idx, i in enumerate(window):
         here = start + idx == cursor
         ds = ("dim",) if i["closed"] else ()
@@ -826,11 +860,28 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
                               i["state"], nxt, i["age"], i["task_start"],
                               i["previous_node_start"], ms, ds,
                               STATE_STYLE.get(i["state"], ()), ns, ds, ds, ds, i=i, bg=bg))
+        row_backgrounds.append(bg)
     # The last two lines are fixed furniture: the message line, then the key legend.
     # The message line is reserved even when empty so the board never shifts under a keypress.
     lines.append("")
-    lines.append(_paint(_fit(message[0], width), *message[1]) if message else "")
-    lines.append("".join(_paint(t, *s) for t, s in _fit_segments(_legend_segments(), width)[0]))
+    lines.append(_paint(_fit(message[0], frame_width), *message[1]) if message else "")
+    lines.append("".join(_paint(t, *s) for t, s in _fit_segments(_legend_segments(), frame_width)[0]))
+
+    if scrollbar_width:
+        def edge_line(line, marker=" ", styles=()):
+            padding = " " * max(0, content_width - _visible_dw(line))
+            return line + padding + _paint(marker, *styles)
+
+        decorated = []
+        for line_no, line in enumerate(lines):
+            if 3 <= line_no < 3 + len(window):
+                slot = line_no - 3
+                marker, styles = scroll_slots[slot]
+                styles = tuple(row_backgrounds[slot]) + tuple(styles)
+                decorated.append(edge_line(line, marker, styles))
+            else:
+                decorated.append(line)
+        lines = decorated
     return "\n".join(lines)
 
 # ---------- interactive board ----------

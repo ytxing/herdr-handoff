@@ -103,8 +103,10 @@ The daemon is manual; never assume it is running:
 ```
 
 The board shows the current state, required action, per-agent Herdr status for both ends,
-`START` (task start), `PREV` (previous node start), state start time, state duration, next retry,
-retry count, and errors.
+`START` (task start), `PREV` (previous node start; the first node falls back to `START`), state start time,
+state duration, next retry, retry count, and errors. Active tasks appear first; each group is ordered by
+the newest current node start time.
+The task rows have a muted right-edge scrollbar when rendered.
 
 The board is interactive and can act on tasks, not just display them:
 

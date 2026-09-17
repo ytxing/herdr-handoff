@@ -8,6 +8,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE_HERDR = ROOT / "tests" / "fake_herdr.py"
@@ -621,7 +622,7 @@ class BoardRenderTests(HandoffTestBase):
             self.handoff._ANSI_ON = False
         plain = re.sub(r"\033\[[0-9;]*m", "", row)
         self.assertEqual(self.handoff._dw(plain), 150)
-        self.assertRegex(row, r"\033\[48;5;238m +\033\[0m$")
+        self.assertRegex(row, r"\033\[48;5;238m(?:\033\[[0-9;]+m)?[│█]\033\[0m$")
 
     def test_checkbox_and_cursor_render_on_the_right_rows(self):
         lines = self.board(130, selected={"t_bbbb333344"}, cursor=1).split("\n")
@@ -640,6 +641,38 @@ class BoardRenderTests(HandoffTestBase):
                          "an unresolvable agent is shown by workspace:tab:pane, not its dead name")
         self.assertNotIn("●", frame, "status dots were dropped in favour of plain words")
         self.assertNotIn("○", frame)
+
+    def test_board_orders_active_tasks_before_inactive_by_latest_node_time(self):
+        c = self.db()
+        times = {
+            "t_aaaa111122": "2026-09-17T08:00:00+00:00",
+            "t_bbbb333344": "2026-09-17T10:00:00+00:00",
+            "t_cccc555566": "2026-09-17T12:00:00+00:00",
+            "t_dddd777777": "2026-09-17T09:00:00+00:00",
+        }
+        for task_id, node_started_at in times.items():
+            c.execute("update tasks set state_since=? where id=?", (node_started_at, task_id))
+        c.execute("update tasks set state='cancelled', action='none' where id='t_dddd777777'")
+        c.commit()
+
+        items = self.handoff.board_items()
+
+        self.assertEqual([item["id"] for item in items],
+                         ["t_bbbb333344", "t_aaaa111122", "t_cccc555566", "t_dddd777777"])
+
+    def test_inactive_task_age_is_frozen_at_terminal_transition(self):
+        c = self.db()
+        c.execute("update tasks set state='finished', action='none', state_since=?, last_action_at=? where id=?",
+                  ("2000-01-01T00:00:00+00:00", "2000-01-01T00:02:00+00:00", "t_cccc555566"))
+        c.commit()
+
+        with patch.object(self.handoff.time, "time", return_value=946684800):
+            first = next(item for item in self.handoff.board_items() if item["id"] == "t_cccc555566")
+        with patch.object(self.handoff.time, "time", return_value=4102444800):
+            later = next(item for item in self.handoff.board_items() if item["id"] == "t_cccc555566")
+
+        self.assertEqual(first["age"], "2m")
+        self.assertEqual(later["age"], first["age"])
 
     def test_status_words_line_up_down_a_column(self):
         """Names are padded to the column's widest, so the states read as a straight line.
@@ -681,6 +714,36 @@ class BoardRenderTests(HandoffTestBase):
                                                   height=height, cursor=cursor).split("\n")
                 self.assertLessEqual(len(lines), height,
                                      "height=%d cursor=%d produced %d lines" % (height, cursor, len(lines)))
+
+    def test_scrollbar_marks_the_visible_window_at_the_right_edge(self):
+        short_items = self.handoff.board_items()
+        short = self.handoff.render_board(80, statuses=self.statuses, tabs=self.tabs,
+                                          items=short_items, height=20).splitlines()
+        self.assertNotIn("│", short[2], "the list header has no scrollbar cell")
+        self.assertEqual(short[3][-1], "│", "the track remains visible beside task rows")
+
+        items = self.seed_many()
+        height = 12
+        room = height - self.handoff.BOARD_CHROME
+
+        def slots(cursor):
+            lines = self.handoff.render_board(80, statuses=self.statuses, items=items,
+                                              height=height, cursor=cursor).splitlines()
+            return [line[-1] for line in lines[3:3 + room]]
+
+        top = slots(0)
+        bottom = slots(len(items) - 1)
+        self.assertEqual(top, ["█", "█", "│", "│", "│", "│"])
+        self.assertEqual(bottom, ["│", "│", "│", "│", "█", "█"])
+
+        self.handoff._ANSI_ON = True
+        try:
+            colored = self.handoff.render_board(80, statuses=self.statuses, items=items,
+                                                 height=height, cursor=0)
+        finally:
+            self.handoff._ANSI_ON = False
+        self.assertIn("\033[90m█", colored, "the scrollbar thumb uses a muted gray")
+        self.assertNotIn("\033[36m█", colored, "the scrollbar thumb is not bright cyan")
 
     def test_the_window_follows_the_cursor(self):
         items = self.seed_many()
@@ -785,6 +848,22 @@ class BoardRenderTests(HandoffTestBase):
         self.assertIn("PREV", header)
         self.assertIn(self.handoff._display_time(task_start), row)
         self.assertIn(self.handoff._display_time(previous_start), row)
+
+    def test_board_falls_back_to_task_start_when_previous_node_is_missing(self):
+        task_start = "2026-09-16T08:09:00+00:00"
+        c = self.db()
+        c.execute("update tasks set task_started_at=?,previous_node_started_at=null,state_since=? where id=?",
+                  (task_start, task_start, "t_aaaa111122"))
+        c.commit()
+
+        item = next(item for item in self.handoff.board_items() if item["id"] == "t_aaaa111122")
+        self.assertEqual(item["previous_node_start"], self.handoff._display_time(task_start))
+        self.assertEqual(item["previous_node_start"], item["task_start"])
+
+        frame = self.board(150)
+        row = [line for line in frame.splitlines() if "t_aaaa111122" in line][0]
+        self.assertEqual(row.count(self.handoff._display_time(task_start)), 2,
+                         "START and the PREV fallback should show the same initial node time")
 
     def test_cjk_measures_as_two_columns(self):
         dw, fit = self.handoff._dw, self.handoff._fit
