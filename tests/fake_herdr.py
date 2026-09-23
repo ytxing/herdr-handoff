@@ -70,6 +70,16 @@ def main(argv):
               "result": {"agent": dict(AGENT, pane_id=target), "type": "agent_info"}})
         return 0
 
+    if cmd[:2] == ["agent", "read"]:
+        path = os.environ.get("FAKE_HERDR_READ_FILE")
+        if path:
+            try:
+                with open(path) as fh:
+                    sys.stdout.write(fh.read())
+            except FileNotFoundError:
+                pass
+        return 0
+
     if cmd[:2] == ["agent", "list"]:
         emit({"id": "cli:agent:list", "result": {"agents": [AGENT], "type": "agent_list"}})
         return 0

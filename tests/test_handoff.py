@@ -5,8 +5,12 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import http.server
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +19,51 @@ FAKE_HERDR = ROOT / "tests" / "fake_herdr.py"
 
 INSERT = ("insert into tasks(id,description,prompt,source_pane,target_pane,state,action,state_since)"
           " values(?,?,?,?,?,?,?,?)")
+
+# A row's age is carried by state_since, so an aged fixture is just an old timestamp.
+def ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+class JevStub:
+    """A local stand-in for the System One endpoint, reached through TYPESAFE_API_URL.
+
+    Isolation sits at the URL rather than by patching jev_ask in-process for the same reason
+    herdr isolation sits at HERDR_BIN_PATH: the daemon is a subprocess, and an in-process
+    patch never reaches it.
+    """
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.requests = []
+        stub = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                stub.requests.append(json.loads(body))
+                data = json.dumps({"model": "jev-latest", "answers": stub.answers,
+                                   "usage": {"input_tokens": 1, "output_tokens": 1}}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args): pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.url = "http://127.0.0.1:%d/v1/systemone" % self.server.server_address[1]
+
+    def activate(self):
+        os.environ["TYPESAFE_API_KEY"] = "test-key"
+        os.environ["TYPESAFE_API_URL"] = self.url
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
 
 
 class HandoffTestBase(unittest.TestCase):
@@ -53,10 +102,41 @@ class HandoffTestBase(unittest.TestCase):
         if not self.prompt_log.exists(): return []
         return [l.split("\t", 1)[0] for l in self.prompt_log.read_text().splitlines() if l]
 
+    def sweeps(self, n=1):
+        """Wait for `n` daemon sweeps plus the longest single wait one of them can park on.
+
+        Both terms are read from the module the test's own environment configured, so a test
+        written as "two sweeps" stays two sweeps whatever period the suite is running at.
+        """
+        time.sleep(self.handoff.SWEEP_SECONDS * n
+                   + self.handoff.AGENT_WAIT_SLICE_MS / 1000.0 + 0.3)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self._conns = []
         os.environ["HANDOFF_STATE_DIR"] = self.tmp.name
+        # Jev must be off by default in tests: a developer shell carrying TYPESAFE_API_KEY
+        # would otherwise let the daemon tests place real API calls.
+        self._saved_jev = {k: os.environ.get(k)
+                           for k in ("TYPESAFE_API_KEY", "TYPESAFE_API_URL", "HANDOFF_JEV",
+                                     "HANDOFF_JEV_MIN_INTERVAL")}
+        for k in self._saved_jev: os.environ.pop(k, None)
+        # Tests ask Jev several times in a row on purpose; the floor between requests is a
+        # production guard, and the test that wants it sets it for itself.
+        os.environ["HANDOFF_JEV_MIN_INTERVAL"] = "0"
+        # Removing the key switches Jev off, but the module still resolves its default URL at
+        # import, and a test that turns the key back on would send to whatever that resolved
+        # to. Pointing it at a closed local port is what makes "no test reaches the live API"
+        # a property of the harness rather than of every test remembering to stub.
+        os.environ["TYPESAFE_API_URL"] = "http://127.0.0.1:1/dead"
+        # The daemon tests wait on a real daemon doing real sweeps, and at the production
+        # period that waiting is 45 seconds of this suite -- all of it `time.sleep`. Both
+        # clocks are env-tunable, so a test asks for the same number of sweeps in a fraction
+        # of the wall time; tests wait through sweeps() so the two stay in step.
+        self._saved_timings = {k: os.environ.get(k)
+                               for k in ("HANDOFF_SWEEP_SECONDS", "HANDOFF_AGENT_WAIT_SLICE_MS")}
+        os.environ["HANDOFF_SWEEP_SECONDS"] = "0.1"
+        os.environ["HANDOFF_AGENT_WAIT_SLICE_MS"] = "100"
         self.isolate_herdr()
         sys.path.insert(0, str(ROOT))
         sys.modules.pop("handoff", None)
@@ -67,6 +147,12 @@ class HandoffTestBase(unittest.TestCase):
         for c in self._conns:
             try: c.close()
             except Exception: pass
+        for k, v in self._saved_jev.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
+        for k, v in self._saved_timings.items():
+            if v is None: os.environ.pop(k, None)
+            else: os.environ[k] = v
         if self._saved_herdr is None: os.environ.pop("HERDR_BIN_PATH", None)
         else: os.environ["HERDR_BIN_PATH"] = self._saved_herdr
         os.environ.pop("FAKE_HERDR_LOG", None)
@@ -186,6 +272,8 @@ class HandoffCliTests(HandoffTestBase):
                 columns = {row[1] for row in c.execute("pragma table_info(tasks)")}
                 self.assertIn("task_started_at", columns)
                 self.assertIn("previous_node_started_at", columns)
+                self.assertIn("source_phase", columns)
+                self.assertIn("target_phase", columns)
                 self.assertEqual(c.execute("select task_started_at from tasks where id='t_a'").fetchone()[0],
                                  "2026-01-01")
             finally:
@@ -223,6 +311,46 @@ class HandoffCliTests(HandoffTestBase):
         result = self.run_cli("delete", "t_test")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIsNone(self.db().execute("select * from tasks where id='t_test'").fetchone())
+
+    def clean_fixture(self, rows):
+        """Seed one task per (state, age in days). setUp's published task is the open control."""
+        c = self.db()
+        for tid, state, age in rows:
+            c.execute(INSERT, (tid, "d", "p", "wA:pX", "wA:pCLEAN-" + tid, state,
+                               "none" if state in self.handoff.CLOSED_STATES else "take", ago(age)))
+        c.commit()
+
+    def remaining(self):
+        return sorted(r[0] for r in self.db().execute("select id from tasks"))
+
+    def test_clean_invalid_collects_only_the_ones_without_a_result(self):
+        self.clean_fixture([("t_absent", "target_absent", 1), ("t_sabsent", "source_absent", 1),
+                            ("t_timeout", "timeout", 1), ("t_cancel", "cancelled", 1),
+                            ("t_fin", "finished", 1), ("t_rej", "rejected", 1)])
+        result = self.run_cli("clean", "invalid")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deleted 4", result.stdout)
+        self.assertEqual(self.remaining(), ["t_fin", "t_rej", "t_test"],
+                         "finished and rejected are outcomes somebody may still read")
+
+    def test_clean_old_collects_terminal_records_past_the_threshold(self):
+        """Age decides, not state -- and an open task is out of reach however old it is."""
+        self.clean_fixture([("t_old_fin", "finished", 30), ("t_old_timeout", "timeout", 30),
+                            ("t_new_fin", "finished", 1)])
+        c = self.db()
+        c.execute("update tasks set state_since=? where id='t_test'", (ago(30),)); c.commit()
+        result = self.run_cli("clean", "old")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("deleted 2", result.stdout)
+        self.assertEqual(self.remaining(), ["t_new_fin", "t_test"],
+                         "the open task survives: deleting it would strand its Target")
+
+    def test_clean_old_takes_a_threshold(self):
+        self.clean_fixture([("t_2d", "finished", 2), ("t_40d", "rejected", 40)])
+        self.assertIn("deleted 1", self.run_cli("clean", "old", "--days", "30").stdout)
+        self.assertEqual(self.remaining(), ["t_2d", "t_test"])
+        self.assertEqual(self.run_cli("clean", "old", "--days", "1").returncode, 0)
+        self.assertEqual(self.remaining(), ["t_test"])
 
     def test_a_failed_delivery_leaves_no_next_step(self):
         """`timeout` after a delivery failure must not name a command.
@@ -342,10 +470,15 @@ class DaemonLifecycleTests(HandoffTestBase):
         except subprocess.TimeoutExpired: pass
 
     def start_daemon(self):
+        # The daemon writes nothing to stderr when it works, so anything there is a crash. It
+        # used to go to DEVNULL, which turned a `NameError` on the second sweep into nothing
+        # but a missing reminder three assertions later; tearDown now reports the text.
+        self.daemon_log = Path(self.tmp.name) / "daemon.err"
+        self._daemon_err = open(self.daemon_log, "wb")
         p = subprocess.Popen([sys.executable, str(ROOT / "handoff.py"), "daemon", "start"],
                              env=dict(os.environ, HANDOFF_STATE_DIR=self.tmp.name),
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                             stderr=self._daemon_err, start_new_session=True)
         # Registered before the wait, not after it: an exception anywhere below used to abandon a
         # daemon that had already been spawned, and a run that left sixteen of them behind is how
         # this was noticed.
@@ -356,6 +489,11 @@ class DaemonLifecycleTests(HandoffTestBase):
         self.fail("daemon never took the lock")
 
     def tearDown(self):
+        if getattr(self, "_daemon_err", None):
+            self._daemon_err.close()
+            noise = (self.daemon_log.read_text().strip()
+                     if self.daemon_log.exists() else "")
+            if noise: self.fail("the daemon wrote to stderr:\n" + noise)
         if self.handoff.daemon_running():
             (Path(self.tmp.name) / "daemon.stop").touch()
             for _ in range(80):
@@ -430,18 +568,80 @@ class DaemonLifecycleTests(HandoffTestBase):
         p = None
         try:
             p = self.start_daemon()
-            time.sleep(self.handoff.SWEEP_SECONDS * 2 + 1)
+            self.sweeps(2)
             self.assertEqual(self.delivered(), [], "a focused pane must not be reminded")
             self.assertEqual(
                 self.db().execute("select retry_count from tasks where id='t_nag'").fetchone()[0], 0,
                 "holding off must not spend a retry")
 
             focus_file.unlink()                    # the user looks elsewhere
-            time.sleep(self.handoff.SWEEP_SECONDS * 2 + 1)
+            self.sweeps(2)
             self.assertIn("wA:pTEST-FOCUSED", self.delivered(),
                           "reminders resume once the pane is no longer focused")
         finally:
             os.environ.pop("FAKE_HERDR_FOCUS_FILE", None)
+            if p: self.reap(p)
+
+    def test_interruption_markers_cover_codex_and_claude(self):
+        for snapshot in ("■ Conversation interrupted - tell the model what to do differently.",
+                          "[Request interrupted by user]"):
+            with patch.object(self.handoff, "agent_read", return_value=snapshot):
+                self.assertTrue(self.handoff.agent_was_interrupted("wA:pTEST"), snapshot)
+        with patch.object(self.handoff, "agent_read", return_value="› Ask Claude to do anything"):
+            self.assertFalse(self.handoff.agent_was_interrupted("wA:pTEST"))
+
+    def test_a_reminder_holds_off_after_the_user_interrupts_the_agent(self):
+        """A current Herdr detection snapshot can identify an interrupted turn."""
+        c = self.db()
+        c.execute(INSERT, ("t_interrupted", "被打断后不催办", "p", "wA:pTEST-SRC",
+                           "wA:pTEST-INTERRUPTED", "published", "take", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=? where id='t_interrupted'", (self.handoff.now(),))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("■ Conversation interrupted - tell the model what to do differently.\n")
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        p = None
+        try:
+            p = self.start_daemon()
+            self.sweeps(2)
+            self.assertEqual(self.delivered(), [], "an interrupted turn must not be reminded")
+            self.assertEqual(
+                self.db().execute("select retry_count from tasks where id='t_interrupted'").fetchone()[0], 0,
+                "an interruption must not spend a retry")
+
+            read_file.write_text("› Ask Codex to do anything\n")
+            self.sweeps(2)
+            self.assertIn("wA:pTEST-INTERRUPTED", self.delivered(),
+                          "reminders resume when the interruption marker leaves the snapshot")
+        finally:
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+    def test_a_blocked_agent_is_waited_on_not_reminded(self):
+        """An approval prompt is someone being asked something, not an agent ignoring us.
+
+        herdr refuses a prompt to a blocked pane before any input is sent, so a reminder here
+        would bounce -- and if the refusal counted as an attempt, three of them would walk the
+        task to `timeout` with nothing ever delivered.
+        """
+        c = self.db()
+        c.execute(INSERT, ("t_blocked", "等一个批准框", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "published", "take", self.handoff.now()))
+        c.commit()
+        os.environ["FAKE_HERDR_STATUS"] = "blocked"
+        os.environ["FAKE_HERDR_WAIT_S"] = "30"      # never reaches idle while blocked
+        p = None
+        try:
+            p = self.start_daemon()
+            self.sweeps(3)
+            row = dict(self.db().execute(
+                "select * from tasks where id='t_blocked'").fetchone())
+            self.assertEqual(row["state"], "published", "a human deciding is not a timeout")
+            self.assertEqual(row["retry_count"], 0, "and it does not spend an attempt")
+            self.assertEqual(self.delivered(), [], "no reminder is pushed at the prompt")
+        finally:
+            os.environ.pop("FAKE_HERDR_STATUS", None)
+            os.environ.pop("FAKE_HERDR_WAIT_S", None)
             if p: self.reap(p)
 
     def test_stop_works_while_the_daemon_waits_on_a_busy_agent(self):
@@ -459,7 +659,7 @@ class DaemonLifecycleTests(HandoffTestBase):
         p = None
         try:
             p = self.start_daemon()
-            time.sleep(self.handoff.SWEEP_SECONDS + 2)   # let it get into the wait
+            self.sweeps()   # let it get into the wait
             result = self.run_cli("daemon", "stop")
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
             self.assertIn("daemon stopped", result.stdout)
@@ -512,7 +712,7 @@ class DaemonLifecycleTests(HandoffTestBase):
         p = self.start_daemon()
         try:
             (Path(self.tmp.name) / "daemon.stop").write_text("999999")   # some other daemon
-            time.sleep(self.handoff.SWEEP_SECONDS + 2)
+            self.sweeps()
             self.assertTrue(self.handoff.daemon_running(),
                             "a request addressed to a different daemon must be ignored")
         finally:
@@ -538,6 +738,392 @@ class DaemonLifecycleTests(HandoffTestBase):
         self.assertIn("daemon stopped", result.stdout)
         self.assertFalse(self.handoff.daemon_running())
         p.wait()
+
+    def test_the_daemon_scores_nothing_on_its_own(self):
+        """Scoring is on demand from the board; the sweep never asks for one.
+
+        A background score would rewrite the number under whoever is reading the board, and
+        a reviewer would have no way to tell their own review from the daemon's guess. The
+        idle reason is the same kind of reading, so the sweep is not allowed to leave one
+        either: both columns move only when the review key is pressed.
+        """
+        c = self.db()
+        c.execute(INSERT, ("t_phase", "不自动打分", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "active", "done", self.handoff.now()))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("editing handoff.py ...\n")
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        os.environ["FAKE_HERDR_STATUS"] = "working"
+        stub = JevStub({"hold_off": {"type": "noul", "noul": 0.9},
+                        "work_progress": {"type": "score", "score": 6.4}})
+        stub.activate()
+        p = None
+        try:
+            p = self.start_daemon()
+            self.sweeps(3)
+            row = self.db().execute(
+                "select target_phase from tasks where id='t_phase'").fetchone()
+            self.assertIsNone(row[0], "the daemon must not write a score by itself")
+            self.assertTrue(stub.requests)
+            self.assertEqual(set(stub.requests[0]["questions"]), {"hold_off"},
+                             "the sweep asks the reminder question and nothing else")
+            row = self.db().execute(
+                "select target_stage from tasks where id='t_phase'").fetchone()
+            self.assertIsNone(row[0], "and writes no observation of its own")
+        finally:
+            stub.stop()
+            os.environ.pop("FAKE_HERDR_STATUS", None)
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+    def test_jev_suppresses_a_reminder_without_any_marker(self):
+        """The snapshot carries no interruption marker; only Jev's judgment holds the reminder."""
+        c = self.db()
+        c.execute(INSERT, ("t_jevsup", "主动结束则不催", "p", "wA:pTEST-SRC", "wA:pTEST-JEV",
+                           "published", "take", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=? where id='t_jevsup'", (self.handoff.now(),))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("用户按了 Esc，回合已结束\n")   # deliberately no known marker
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        stub = JevStub({"hold_off": {"type": "noul", "noul": 0.97}})
+        stub.activate()
+        p = None
+        try:
+            p = self.start_daemon()
+            self.sweeps(2)
+            self.assertEqual(self.delivered(), [], "a user-ended turn must not be reminded")
+            self.assertEqual(
+                self.db().execute("select retry_count from tasks where id='t_jevsup'").fetchone()[0],
+                0, "suppression must not spend a retry")
+            self.assertTrue(stub.requests)
+            self.assertIn("hold_off", stub.requests[0]["questions"])
+
+            stub.answers["hold_off"]["noul"] = 0.05        # the simulation finished; resume
+            self.sweeps(2)
+            self.assertIn("wA:pTEST-JEV", self.delivered())
+            log = self.prompt_log.read_text()
+            self.assertIn("[HANDOFF REMINDER]", log, "the reminder text is the standard one")
+            self.assertIn(self.handoff.REMINDER_WHY["take"].replace("\n", "\\n"), log)
+        finally:
+            stub.stop()
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+
+class JevTests(HandoffTestBase):
+    """Jev paths, with the model itself either stubbed over HTTP or patched out."""
+
+    def row(self, action="take"):
+        return {"id": "t_jev", "description": "d", "prompt": "p", "action": action}
+
+    def test_jev_requires_an_api_key(self):
+        self.assertFalse(self.handoff.jev_enabled(), "the base class strips the key")
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        self.assertTrue(self.handoff.jev_enabled())
+        os.environ["HANDOFF_JEV"] = "0"
+        self.assertFalse(self.handoff.jev_enabled(), "HANDOFF_JEV=0 is the kill switch")
+
+    def test_jev_is_asked_at_most_once_per_interval(self):
+        """A second request inside the window is dropped before it leaves the process."""
+        os.environ["HANDOFF_JEV_MIN_INTERVAL"] = "30"
+        stub = JevStub({"q": {"type": "noul", "noul": 0.9}})
+        stub.activate()
+        try:
+            q = {"q": {"type": "noul", "instructions": "i"}}
+            self.assertEqual(self.handoff.jev_ask({}, q), {"q": 0.9})
+            self.assertIsNone(self.handoff.jev_ask({}, q),
+                              "the second call inside the window is refused")
+            self.assertEqual(len(stub.requests), 1, "and never reaches the endpoint")
+            self.assertGreater(self.handoff.jev_wait_left(), 0)
+        finally:
+            stub.stop()
+
+    def test_the_window_reopens(self):
+        os.environ["HANDOFF_JEV_MIN_INTERVAL"] = "0.3"
+        self.handoff.jev_ask({}, {"q": {"type": "noul", "instructions": "i"}})
+        os.environ["TYPESAFE_API_URL"] = "http://127.0.0.1:1/dead"
+        self.assertIsNone(self.handoff.jev_ask({}, {"q": {"type": "noul", "instructions": "i"}}),
+                          "still inside the window")
+        time.sleep(0.35)
+        self.assertEqual(self.handoff.jev_wait_left(), 0.0, "and then it is over")
+
+    def test_a_stray_key_cannot_reach_the_live_endpoint(self):
+        """A test that turns Jev on without a stubbed URL must fail locally, not call out.
+
+        The default URL is resolved at import from the environment, so removing the key alone
+        would leave the live endpoint in place for any test that set it back.
+        """
+        os.environ["TYPESAFE_API_KEY"] = "k"          # deliberately no URL override
+        self.assertTrue(self.handoff.jev_enabled())
+        self.assertIn("127.0.0.1", self.handoff.JEV_URL,
+                      "the harness, not the API, is what an unstubbed call resolves to")
+        self.assertIsNone(self.handoff.jev_ask({}, {"q": {"type": "noul", "instructions": "i"}}),
+                          "the call fails on the closed port instead of leaving the machine")
+
+    def test_jev_ask_parses_answers(self):
+        stub = JevStub({"hold_off": {"type": "noul", "noul": 0.9},
+                        "t_x": {"type": "score", "score": 6.4, "confidence": 0.7}})
+        stub.activate()
+        try:
+            out = self.handoff.jev_ask({"x": 1}, {
+                "hold_off": {"type": "noul", "instructions": "i"},
+                "t_x": {"type": "score", "instructions": "i",
+                        "criteria": self.handoff.JEV_SCORE_LEVELS}})
+        finally:
+            stub.stop()
+        self.assertEqual(out, {"hold_off": 0.9, "t_x": 6.4})
+
+    def test_jev_ask_partial_keeps_the_answers_that_arrived(self):
+        """The board's batch review must not lose five scores to one malformed answer."""
+        stub = JevStub({"t_a": {"type": "score", "score": 3.2}})      # t_b never comes back
+        stub.activate()
+        try:
+            questions = {"t_a": {"type": "score", "instructions": "i",
+                                 "criteria": self.handoff.JEV_SCORE_LEVELS},
+                         "t_b": {"type": "score", "instructions": "i",
+                                 "criteria": self.handoff.JEV_SCORE_LEVELS}}
+            self.assertIsNone(self.handoff.jev_ask({}, questions),
+                              "the daemon's strict mode still fails the whole request")
+            self.assertEqual(self.handoff.jev_ask({}, questions, partial=True), {"t_a": 3.2})
+        finally:
+            stub.stop()
+        self.assertEqual(stub.requests[0]["model"], "jev-latest")
+
+    def test_jev_ask_returns_none_on_failure(self):
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        os.environ["TYPESAFE_API_URL"] = "http://127.0.0.1:1/unreachable"
+        self.assertIsNone(self.handoff.jev_ask({}, {"q": {"type": "noul", "instructions": "i"}}),
+                          "any transport failure degrades to the pre-Jev path")
+
+    def test_decide_reminder_holds_off_when_the_user_ended_the_turn(self):
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        with patch.object(self.handoff, "agent_read", return_value="snapshot"), \
+             patch.object(self.handoff, "jev_ask",
+                          return_value={"hold_off": 0.9}) as ask:
+            self.assertIsNone(self.handoff.decide_reminder(self.row(), "wA:pX"))
+        self.assertTrue(ask.called)
+
+    def test_decide_reminder_reuses_the_daemons_answers(self):
+        """Pre-fetched answers must not trigger a second request for the same sweep."""
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        with patch.object(self.handoff, "jev_ask") as ask:
+            text = self.handoff.decide_reminder(
+                self.row(), "wA:pX", snapshot="snapshot",
+                answers={"hold_off": 0.1})
+            self.assertEqual(text, self.handoff.reminder_text(self.row(), "take"),
+                             "a low hold_off sends the one standard reminder")
+            suppressed = self.handoff.decide_reminder(
+                self.row(), "wA:pX", snapshot="snapshot",
+                answers={"hold_off": 0.9})
+            self.assertIsNone(suppressed)
+        self.assertFalse(ask.called, "the answers were already paid for")
+
+    def test_a_transition_clears_the_progress_score(self):
+        """A score belongs to the node it described; a new state re-judges from scratch."""
+        c = self.db()
+        c.execute(INSERT, ("t_score", "打分", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "active", "done", self.handoff.now()))
+        c.execute("update tasks set target_phase='7' where id='t_score'")
+        c.commit()
+        self.handoff.transition(c, "t_score", "result_ready", "claim", "done")
+        row = self.db().execute("select target_phase from tasks where id='t_score'").fetchone()
+        self.assertIsNone(row[0])
+
+    def test_decide_reminder_falls_back_to_markers_when_jev_fails(self):
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        marker = "■ Conversation interrupted - tell the model what to do differently."
+        with patch.object(self.handoff, "agent_read", return_value=marker), \
+             patch.object(self.handoff, "jev_ask", return_value=None):
+            self.assertIsNone(self.handoff.decide_reminder(self.row(), "wA:pX"),
+                              "a failed Jev call must not weaken the marker suppression")
+        with patch.object(self.handoff, "agent_read", return_value="› idle"), \
+             patch.object(self.handoff, "jev_ask", return_value=None):
+            text = self.handoff.decide_reminder(self.row(), "wA:pX")
+        self.assertEqual(text, self.handoff.reminder_text(self.row(), "take"),
+                         "failure falls back to the standard reminder")
+
+    def seed_open_tasks(self):
+        c = self.db()
+        c.execute(INSERT, ("t_open1", "第一个", "p1", "wA:pTEST-SRC", "wA:pTEST-A",
+                           "published", "take", self.handoff.now()))
+        c.execute(INSERT, ("t_open2", "第二个", "p2", "wA:pTEST-SRC", "wA:pTEST-B",
+                           "result_ready", "claim", self.handoff.now()))
+        c.execute(INSERT, ("t_done", "已结束", "p3", "wA:pTEST-SRC", "wA:pTEST-C",
+                           "finished", "none", self.handoff.now()))
+        c.commit()
+        return c
+
+    def test_review_scores_every_open_task_in_one_request(self):
+        """One request for the whole board, one question per open task, no closed ones."""
+        c = self.seed_open_tasks()
+        stub = JevStub({"t_open1": {"type": "score", "score": 7.6, "confidence": 0.8},
+                        "t_open2": {"type": "score", "score": 2.2}})
+        stub.activate()
+        try:
+            scored, unanswered = self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        self.assertEqual(len(stub.requests), 1, "the whole board costs one request")
+        self.assertEqual(set(stub.requests[0]["questions"]),
+                         {"t_open1", "t_open2", "t_open1_state", "t_open2_state"},
+                         "a score and a state per open task, and nothing about closed ones")
+        self.assertEqual(scored, {"t_open1": "7.6", "t_open2": "2.2"},
+                         "the score is stored as it arrived, not snapped to a level")
+        self.assertEqual(unanswered, 0)
+        row = dict(c.execute("select * from tasks where id='t_open1'").fetchone())
+        self.assertEqual(row["target_phase"], "7.6", "take is the Target's step, so dst_phase")
+        row = dict(c.execute("select * from tasks where id='t_open2'").fetchone())
+        self.assertEqual(row["source_phase"], "2.2", "claim is the Source's step, so src_phase")
+        closed = dict(c.execute("select * from tasks where id='t_done'").fetchone())
+        self.assertIsNone(closed["source_phase"])
+        self.assertIsNone(closed["target_phase"])
+
+    def test_review_state_carries_the_task_history(self):
+        """A snapshot alone cannot tell a fresh task from one that has been retried four times."""
+        c = self.seed_open_tasks()
+        c.execute("update tasks set retry_count=4, last_action='take',"
+                  " previous_node_started_at='2026-09-23T10:00:00+00:00',"
+                  " target_lifecycle='working', source_phase='3' where id='t_open2'")
+        c.commit()
+        stub = JevStub({"t_open2": {"type": "score", "score": 5.0}})
+        stub.activate()
+        try:
+            self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        state = stub.requests[0]["state"]
+        sent = next(t for t in state["tasks"] if t["id"] == "t_open2")
+        self.assertEqual(sent["retry_count"], 4, "spent retries travel with the task")
+        self.assertEqual(sent["last_action"], "take")
+        self.assertEqual(sent["previous_node_started_at"], "2026-09-23T10:00:00+00:00",
+                         "the node before this one is part of the judgment")
+        self.assertEqual(sent["source"]["previous_score"], "3",
+                         "the score a previous review left is shown, not silently replaced")
+        self.assertEqual(sent["target"]["lifecycle"], "working")
+        self.assertIn("state_since", sent)
+
+    def test_the_review_asks_one_state_question_per_task(self):
+        """Both kinds of answer live in the one menu: where the work is, and why it is parked."""
+        c = self.seed_open_tasks()          # t_open1 published/take, t_open2 result_ready/claim
+        stub = JevStub({"t_open1": {"type": "score", "score": 4.0},
+                        "t_open1_state": {"type": "choice", "choice": "waiting"},
+                        "t_open2": {"type": "score", "score": 7.0},
+                        "t_open2_state": {"type": "choice", "choice": "verifying"}})
+        stub.activate()
+        try:
+            self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        choices = stub.requests[0]["questions"]["t_open1_state"]["criteria"]
+        self.assertEqual(set(choices), set(self.handoff.JEV_STATE_OPTIONS))
+        row = dict(c.execute("select * from tasks where id='t_open1'").fetchone())
+        self.assertEqual(row["target_stage"], "waiting", "the Target owes the take")
+        row = dict(c.execute("select * from tasks where id='t_open2'").fetchone())
+        self.assertEqual(row["source_stage"], "verifying", "the Source owes the claim")
+        self.assertIsNone(row["target_stage"])
+
+    def test_an_answer_outside_the_menu_is_not_a_reading(self):
+        c = self.seed_open_tasks()
+        stub = JevStub({"t_open1": {"type": "score", "score": 4.0},
+                        "t_open1_state": {"type": "choice", "choice": "working"},
+                        "t_open2": {"type": "score", "score": 7.0},
+                        "t_open2_state": {"type": "choice", "choice": "tie"}})
+        stub.activate()
+        try:
+            self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        row = dict(c.execute("select * from tasks where id='t_open1'").fetchone())
+        self.assertEqual(row["target_stage"], "working")
+        row = dict(c.execute("select * from tasks where id='t_open2'").fetchone())
+        self.assertIsNone(row["source_stage"], "not one of the twenty, so nothing is stored")
+
+    def test_an_unanswered_state_question_leaves_the_last_answer(self):
+        """`partial` is per question: a missing answer must not erase the one on file."""
+        c = self.seed_open_tasks()
+        c.execute("update tasks set target_stage='diagnosing' where id='t_open1'")
+        c.commit()
+        stub = JevStub({"t_open1": {"type": "score", "score": 4.0},
+                        "t_open2": {"type": "score", "score": 7.0}})
+        stub.activate()
+        try:
+            self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        row = dict(c.execute("select * from tasks where id='t_open1'").fetchone())
+        self.assertEqual(row["target_stage"], "diagnosing",
+                         "the question went unanswered, so the answer on file stands")
+
+    def test_a_state_change_drops_a_stale_state_word(self):
+        """The word describes one node; the node after it has its own."""
+        c = self.db()
+        c.execute(INSERT, ("t_idle", "为什么", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "active", "done", self.handoff.now()))
+        c.execute("update tasks set target_stage='waiting' where id='t_idle'")
+        c.commit()
+        self.handoff.transition(c, "t_idle", "result_ready", "claim", "done")
+        row = self.db().execute("select target_stage from tasks where id='t_idle'").fetchone()
+        self.assertIsNone(row[0], "the word described the node the task has left")
+
+    def test_a_failed_review_leaves_the_scores_standing(self):
+        """An outage must not blank numbers somebody is reading."""
+        c = self.seed_open_tasks()
+        c.execute("update tasks set target_phase='6' where id='t_open1'")
+        c.commit()
+        os.environ["TYPESAFE_API_KEY"] = "k"
+        os.environ["TYPESAFE_API_URL"] = "http://127.0.0.1:1/unreachable"
+        scored, unanswered = self.handoff.jev_score_all(c)
+        self.assertEqual(scored, {})
+        self.assertEqual(unanswered, 2)
+        self.assertEqual(
+            dict(c.execute("select * from tasks where id='t_open1'").fetchone())["target_phase"],
+            "6", "the previous score survives a failed review")
+        self.assertIn("scores unchanged", self.handoff.review_summary(scored, unanswered))
+
+    def test_review_summary_counts_without_naming_tasks(self):
+        self.assertEqual(self.handoff.review_summary({}, 0), "No open task to score")
+        line = self.handoff.review_summary({"t_a": "3", "t_b": "5"}, 1)
+        self.assertIn("Scored 2 tasks", line)
+        self.assertIn("1 unanswered", line)
+        self.assertNotIn("t_", line, "no task ids in the message")
+
+    def test_every_board_key_is_a_single_press(self):
+        """Scoring and deleting are plain keys, and no key waits for a second one.
+
+        `clean` is a command; the board's `d` deletes what is checked, not what a filter
+        matches, so the two never needed to share a prefix.
+        """
+        self.assertEqual([k for k, _ in self.handoff.LEGEND],
+                         ["↑↓", "space", "a", "r", "s", "d", "t", "q"])
+        self.assertEqual(dict(self.handoff.LEGEND)["s"], "jev score")
+        frame = self.handoff.render_board(150, statuses={}, tabs={}, items=[])
+        self.assertIn("jev score", frame)
+
+    def test_invalid_tasks_are_the_ones_that_ended_without_a_result(self):
+        c = self.db()
+        for tid, state in (("t_a", "target_absent"), ("t_b", "source_absent"),
+                           ("t_c", "timeout"), ("t_d", "cancelled"),
+                           ("t_e", "finished"), ("t_f", "rejected"), ("t_g", "active")):
+            c.execute(INSERT, (tid, "d", "p", "wA:pX", "wA:pY", state,
+                               "none" if state in self.handoff.CLOSED_STATES else "take",
+                               self.handoff.now()))
+        c.commit()
+        self.assertEqual(sorted(self.handoff.invalid_task_ids(c)),
+                         ["t_a", "t_b", "t_c", "t_d"],
+                         "a finished or rejected task is an outcome somebody may still read")
+        self.assertEqual(self.handoff.delete_tasks(c, self.handoff.invalid_task_ids(c)), 4)
+        self.assertEqual(sorted(r[0] for r in c.execute("select id from tasks")),
+                         ["t_e", "t_f", "t_g"])
+
+    def test_decide_reminder_without_jev_matches_the_legacy_path(self):
+        with patch.object(self.handoff, "agent_read",
+                          return_value="[Request interrupted by user]"):
+            self.assertIsNone(self.handoff.decide_reminder(self.row(), "wA:pX"))
+        with patch.object(self.handoff, "agent_read", return_value="› idle"):
+            text = self.handoff.decide_reminder(self.row(), "wA:pX")
+        self.assertEqual(text, self.handoff.reminder_text(self.row(), "take"))
 
 
 class BoardRenderTests(HandoffTestBase):
@@ -579,6 +1165,12 @@ class BoardRenderTests(HandoffTestBase):
             self.assertEqual(self.handoff.terminal_size(), (79, 20))
         finally:
             self.handoff.os.get_terminal_size = get_size
+
+    def test_confirmation_defaults_to_no(self):
+        self.assertTrue(self.handoff._confirm_yes("y"))
+        self.assertTrue(self.handoff._confirm_yes("Y"))
+        for key in ("\r", "\n", " ", "n", "N", "ESC"):
+            self.assertFalse(self.handoff._confirm_yes(key), repr(key))
 
     def test_no_line_ever_exceeds_the_requested_width(self):
         for width in range(43, 161):
@@ -642,6 +1234,189 @@ class BoardRenderTests(HandoffTestBase):
         self.assertNotIn("●", frame, "status dots were dropped in favour of plain words")
         self.assertNotIn("○", frame)
 
+    def test_board_shows_the_progress_score_on_the_action(self):
+        """Jev's two answers replace the pending command: `verifying 82.22%`."""
+        c = self.db()
+        c.execute("update tasks set target_stage='verifying', target_phase='7.4'"
+                  " where id='t_aaaa111122'")                                       # take
+        c.execute("update tasks set target_phase='9.00' where id='t_cccc555566'")   # finished
+        c.commit()
+        frame = self.board(150)
+        row = [l for l in frame.split("\n") if "t_aaaa111122" in l][0]
+        self.assertIn("verifying 82.22%", row)
+        self.assertNotIn("verifying h2", row,
+                         "the actor's name is already in its own column; a reading is not a command")
+        self.assertNotIn("take", row, "the reading stands in for the implied command")
+        closed = [l for l in frame.split("\n") if "t_cccc555566" in l][0]
+        self.assertNotIn("100.00%", closed,
+                         "a closed task's score is no longer refreshed and stays hidden")
+
+    def test_the_stage_and_the_score_are_shown_side_by_side(self):
+        """The word is a choice Jev made; the percentage is its own answer. Neither derives
+        the other -- a task can be picked as `working` while scoring near either edge."""
+        c = self.db()
+        for i, stage in enumerate(self.handoff.JEV_MOVING):
+            score = i * self.handoff.JEV_SCORE_MAX / (len(self.handoff.JEV_MOVING) - 1)
+            pct = "%.2f%%" % (score * 100 / self.handoff.JEV_SCORE_MAX)
+            c.execute("update tasks set target_stage=?, target_phase=?"
+                      " where id='t_aaaa111122'", (stage, score))
+            c.commit()
+            row = [l for l in self.board(150).split("\n") if "t_aaaa111122" in l][0]
+            self.assertIn("%s %s" % (stage, pct), row, stage)
+
+    def test_off_path_states_are_offered_but_are_not_rungs(self):
+        """Trouble can strike at any point, which is exactly why it cannot be a position."""
+        for word in self.handoff.JEV_HELD:
+            self.assertIn(word, self.handoff.JEV_STATE_OPTIONS, "Jev can pick it")
+            self.assertNotIn(word, self.handoff.JEV_MOVING, "but it is not on the line")
+        self.assertEqual(self.handoff.stage_style("workaround"), ("magenta",),
+                         "off-path states do not borrow a position's colour")
+        self.assertEqual({self.handoff.stage_style(w) for w in ("stuck", "error")}, {("red",)},
+                         "the two that ask for a person look like an alarm")
+        self.assertEqual({self.handoff.stage_style(w) for w in self.handoff.JEV_HELD
+                          if w not in ("stuck", "error")},
+                         {("magenta",)}, "the rest share one colour")
+        self.assertEqual(len(self.handoff.JEV_SCORE_LEVELS), 10)
+        for level in self.handoff.JEV_SCORE_LEVELS:
+            self.assertNotIn(level, self.handoff.JEV_HELD and
+                             [self.handoff.JEV_STATE_OPTIONS[w] for w in self.handoff.JEV_HELD],
+                             "the score's scale stays on the line")
+
+    def test_every_held_word_says_something_different(self):
+        """Nine ways to be off the main line, none of them a synonym of another."""
+        trouble = {w: self.handoff.JEV_STATE_OPTIONS[w] for w in self.handoff.JEV_HELD}
+        self.assertEqual(set(trouble), {"waiting", "restarting", "workaround", "diagnosing",
+                                        "fixing", "error", "unreported", "stuck", "elsewhere"})
+        for word, text in trouble.items():
+            self.assertTrue(text.strip(), word)
+        self.assertEqual(len(set(trouble.values())), len(trouble),
+                         "no two describe the same situation")
+
+    def test_an_off_path_stage_reaches_the_board(self):
+        c = self.db()
+        c.execute("update tasks set target_stage='workaround', target_phase='7.4'"
+                  " where id='t_aaaa111122'")
+        c.commit()
+        row = [l for l in self.board(150).split("\n") if "t_aaaa111122" in l][0]
+        self.assertIn("workaround 82.22%", row,
+                      "the situation and how far along are shown together")
+
+    def test_either_answer_can_arrive_without_the_other(self):
+        c = self.db()
+        c.execute("update tasks set target_stage='verifying', target_phase=NULL"
+                  " where id='t_aaaa111122'")
+        c.execute("update tasks set target_stage=NULL, target_phase='6.60'"
+                  " where id='t_bbbb333344'")
+        c.commit()
+        frame = self.board(150)
+        self.assertIn("verifying", frame, "the word needs no number behind it")
+        self.assertIn("73.33%", frame, "and the number needs no word")
+
+    def test_the_stage_is_a_choice_jev_makes(self):
+        """Named rungs offered as a choice -- not a rounding of the score, and more than ten
+        of them, because a `choice` has no ten-option ceiling the way a score does."""
+        self.assertEqual(list(self.handoff.JEV_STATE_OPTIONS),
+                         self.handoff.JEV_MOVING + self.handoff.JEV_HELD,
+                         "the states on the way first, then the ones that are not")
+        self.assertGreater(len(self.handoff.JEV_MOVING), 10)
+        self.assertEqual(len(self.handoff.JEV_SCORE_LEVELS), 10, "the score keeps its cap")
+
+    def test_the_two_answers_are_not_derived_from_each_other(self):
+        """The stage says where the agent is; the score says how far along that is. Neither
+        list is a restatement of the other, and the same stage can carry either number."""
+        self.assertFalse(set(self.handoff.JEV_SCORE_LEVELS) & set(self.handoff.JEV_STATE_OPTIONS.values()),
+                         "the score's scale must not be the stage list over again")
+        c = self.db()
+        for score in ("1.00", "8.00"):
+            c.execute("update tasks set target_stage='working', target_phase=?"
+                      " where id='t_aaaa111122'", (score,))
+            c.commit()
+            row = [l for l in self.board(150).split("\n") if "t_aaaa111122" in l][0]
+            self.assertIn("working", row)
+        self.assertIn("88.89%", self.board(150),
+                      "`working` at the top of the score scale is shown as it is")
+
+    def test_the_stored_score_is_not_quantised(self):
+        """A score of any precision is kept in full; nothing snaps it to a level."""
+        self.assertEqual(self.handoff.jev_score_text(3.61), "3.61")
+        self.assertEqual(self.handoff.jev_score_text(3.6129), "3.6129")
+        self.assertEqual(self.handoff.jev_score_text(0), "0")
+        self.assertEqual(self.handoff.jev_score_text(9.4), "9")      # clamped to the scale
+        self.assertEqual(self.handoff.jev_score_text(-0.5), "0")
+        self.assertIsNone(self.handoff.jev_score_text(None))
+
+    def test_the_status_columns_are_herdrs_own_words(self):
+        """A fact re-read every frame; Jev's reading of the same agent goes in PROCESS."""
+        c = self.db()
+        c.execute("update tasks set target_stage='waiting', target_phase='3.00'"
+                  " where id='t_aaaa111122'")
+        c.commit()
+        frame = self.board(150)
+        row = [l for l in frame.split("\n") if "t_aaaa111122" in l][0]
+        self.assertIn("idle", row, "the live word stays, whatever the review said")
+        self.assertIn("waiting 33.33%", row, "and the review's word is in the cell beside it")
+        self.assertIn("?:wA:pZZ absent", frame, "an unresolvable pane says so, in red")
+
+    def test_the_state_word_carries_its_own_colour(self):
+        """On the way through, held, or asking for a person -- three readings of one word."""
+        style = self.handoff.stage_style
+        self.assertEqual({style(w) for w in ("stuck", "error")}, {("red",)},
+                         "the two that ask for a person")
+        self.assertEqual({style(w) for w in self.handoff.JEV_HELD
+                          if w not in ("stuck", "error")},
+                         {("magenta",)}, "the rest of the held states share one colour")
+        self.assertEqual({style(w) for w in self.handoff.JEV_MOVING},
+                         {("blue",), ("cyan",), ("yellow",), ("green",)},
+                         "and the moving ones walk the scale")
+        for word in self.handoff.JEV_STATE_OPTIONS:
+            self.assertTrue(style(word)[0] in self.handoff._CODES, word)
+
+    def test_the_process_column_is_not_the_dimmest_thing_on_the_board(self):
+        """It is the column you read first; `dim` made it the hardest to read."""
+        c = self.db()
+        c.execute("update tasks set target_stage='working', target_phase='4'"
+                  " where id='t_aaaa111122'")
+        c.execute("update tasks set target_stage='verifying', target_phase='7'"
+                  " where id='t_bbbb333344'")
+        c.commit()
+        self.assertEqual(set(self.handoff.stage_style(w)
+                             for w in self.handoff.JEV_MOVING),
+                         {("blue",), ("cyan",), ("yellow",), ("green",)},
+                         "every stage is coloured, none of them dim")
+        self.assertEqual(self.handoff.stage_style("unstarted"), ("blue",))
+        self.assertEqual(self.handoff.stage_style("done"), ("green",))
+        frame = self.board(150)
+        self.assertIn("working 44.44%", frame)
+        self.assertIn("verifying 77.78%", frame)
+
+    def test_the_column_is_named_for_what_it_holds(self):
+        """It stopped being only the next command once it carried where the work is."""
+        frame = self.board(150)
+        self.assertIn("PROCESS", frame)
+        self.assertNotIn("ACTION", frame)
+
+    def test_two_close_scores_stay_two_different_percentages(self):
+        """3.2 and 3.8 both used to render as 33%; the answer's own digits now reach the board."""
+        c = self.db()
+        c.execute("update tasks set target_phase='3.21' where id='t_aaaa111122'")
+        c.execute("update tasks set target_phase='3.79' where id='t_bbbb333344'")
+        c.commit()
+        frame = self.board(150)
+        self.assertIn("35.67%", frame)
+        self.assertIn("42.11%", frame)
+
+    def test_the_mine_row_keeps_its_command_alongside_the_score(self):
+        """▶ names the keystroke you owe; the score qualifies it instead of replacing it."""
+        c = self.db()
+        # The ▶ row needs the pending action to be mine: result_ready/claim is the Source's
+        # step, and wA:p2V (HERDR_PANE_ID in this fixture) is t_aaaa111122's Source.
+        c.execute("update tasks set state='result_ready', action='claim',"
+                  " source_stage='working', source_phase='4'"
+                  " where id='t_aaaa111122'")
+        c.commit()
+        row = [l for l in self.board(150).split("\n") if "t_aaaa111122" in l][0]
+        self.assertIn("▶ claim · working 44.44%", row)
+
     def test_board_orders_active_tasks_before_inactive_by_latest_node_time(self):
         c = self.db()
         times = {
@@ -687,15 +1462,18 @@ class BoardRenderTests(HandoffTestBase):
         self.assertEqual(len(set(offsets)), 1,
                          "SRC state words start at differing display columns: %r" % sorted(set(offsets)))
 
-    def test_status_keeps_its_colour_on_a_finished_row(self):
-        """Dimming a closed row must not strip the colour off its status words."""
+    def test_a_finished_row_is_one_grey_end_to_end(self):
+        """Nothing on a closed row keeps a colour: it recedes as one line, not as a rainbow."""
         self.handoff._ANSI_ON = True
         try:
             row = [l for l in self.board(150).split("\n") if "t_cccc555566" in l][0]
         finally:
             self.handoff._ANSI_ON = False
-        self.assertIn("\033[32midle", row, "idle stays green even on a finished row")
-        self.assertIn("\033[32mfinished", row, "the STATE column already behaved this way")
+        closed = "\033[%sm" % self.handoff._CODES["closed"]
+        self.assertIn(closed + "finished", row, "the STATE word takes the row's grey")
+        self.assertIn(closed + "idle", row, "and so do the status words")
+        for colour in ("\033[32m", "\033[33m", "\033[36m", "\033[35m"):
+            self.assertNotIn(colour, row, "a closed row has no live colour left")
 
     def seed_many(self, count=20):
         c = self.db()
@@ -765,21 +1543,31 @@ class BoardRenderTests(HandoffTestBase):
         self.assertEqual(len(frame.split("\n")), len(items) + self.handoff.BOARD_CHROME)
         self.assertNotIn("/%d" % len(items), frame.split("\n")[0])
 
-    def test_nothing_on_the_board_is_bold(self):
-        """Weight was dropped from the whole board: colour alone carries the meaning.
+    def test_the_operators_name_carries_a_travelling_wave(self):
+        """A crest runs along one name per row, in that agent kind's own colour.
 
-        Asserts on the rendered escape codes rather than the style tables, so a bold code
-        reintroduced anywhere in the render path gets caught.
+        Asserts on the rendered escape codes rather than the style tables, so a wave that
+        never reaches a row -- or a colour that silently drops out -- gets caught.
         """
         self.handoff._ANSI_ON = True
         try:
             frame = self.board(150, selected={"t_bbbb333344"}, cursor=1,
                                message=("Deleted 1 task(s)", ("red",)))
+            levels = self.handoff.pulse_level
+            self.assertGreater(len({levels(t) for t in (0.0, 0.4, 0.8, 1.2, 1.6)}), 1,
+                               "the shade has to move")
+            self.assertGreaterEqual(len({levels(0.0, i) for i in range(8)}), 3,
+                                    "and the shade varies along the name -- that is the wave")
+            for level in range(self.handoff.PULSE_LEVELS):
+                code = self.handoff.agent_style("codex", level)[0]
+                self.assertIn(code, self.handoff._CODES, "shades stay pre-registered")
         finally:
             self.handoff._ANSI_ON = False
-        codes = set(re.findall(r"\x1b\[([0-9;]+)m", frame))
-        self.assertEqual(sorted(c for c in codes if c == "1" or c.startswith("1;")), [],
-                         "bold was removed from the board on request")
+        self.assertEqual(self.handoff._CODES["agent:codex"], "38;2;130;139;251",
+                         "codex's colour is the one it was given")
+        self.assertNotIn("\x1b[1m", frame, "weight is still carried by colour alone")
+        self.assertEqual(self.handoff.agent_style("codex"), ("agent:codex",))
+        self.assertEqual(self.handoff.agent_style(None), (), "an unknown pane has no colour")
 
     def test_resend_summary_counts_tasks_without_naming_them(self):
         """A task id would be the longest thing on the line and repeats what the board shows."""
@@ -882,9 +1670,8 @@ class BoardRenderTests(HandoffTestBase):
             "Before any work, run:\npython3 %s take t_aaaa111122 --pane <your-pane>\n\n"
             "Task:\nprompt\n\n"
             "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --pane <your-pane>\n"
-            "If still working run:\npython3 %s progress t_aaaa111122\n"
             'Only if refusing run:\npython3 %s reject t_aaaa111122 --reason "<reason>"'
-            % (cli, cli, cli, cli))
+            % (cli, cli, cli))
         self.assertEqual(self.handoff.task_text(row), expected)
 
     def test_a_resend_is_marked_as_a_repeat(self):
@@ -916,7 +1703,7 @@ class BoardRenderTests(HandoffTestBase):
         c.execute("update tasks set state='finished', action='none' where id='t_cccc555566'")
         c.commit()
         ident = ("--pane", "wA:pTEST-DST")
-        cases = [("take", ident), ("progress", ()), ("reject", ("--reason", "no"))]
+        cases = [("take", ident), ("reject", ("--reason", "no"))]
         for command, extra in cases:
             result = self.run_cli(command, "t_cccc555566", *extra)
             self.assertNotEqual(result.returncode, 0, "%s on a closed task must be refused" % command)

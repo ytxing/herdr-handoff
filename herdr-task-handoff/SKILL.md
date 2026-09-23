@@ -60,9 +60,8 @@ Source. `handoff done` is the only return path; the handoff service saves the re
 notifies Source. Direct Agent-to-Agent Herdr prompts bypass the task record and can cause
 duplicate or untracked delivery.
 
-If work began before `take`, use `--implicit-take` with `done`. Use `progress` only to
-reset the long execution timer. Use `reject` only when explicitly refusing the task; do not
-use it merely because a reminder arrived.
+If work began before `take`, use `--implicit-take` with `done`. Use `reject` only when
+explicitly refusing the task; do not use it merely because a reminder arrived.
 
 A task that needs an answer from Source is not a separate protocol state: submit what you
 have with `done` and put the question in the result file. Source reads it and sends a
@@ -91,6 +90,12 @@ when that deletion is intended.
 To remove a state class or all tasks, use `./handoff delete --state <state>` or
 `./handoff delete --all`.
 
+To collect only records that are safe to drop, use `./handoff clean`. It never touches a task
+that is still open. `./handoff clean invalid` removes the tasks that ended without a result
+(`target_absent`, `source_absent`, `timeout`, `cancelled`); `./handoff clean old` removes any
+terminal task that has stood unchanged for more than 7 days (`--days N` changes that), which
+includes `finished` and `rejected`.
+
 ## Daemon and board
 
 The daemon is manual; never assume it is running:
@@ -102,7 +107,12 @@ The daemon is manual; never assume it is running:
 ./handoff daemon stop
 ```
 
-The board shows the current state, required action, per-agent Herdr status for both ends,
+The board shows the current state, what the process column makes of it (the next command, or
+Jev's reading of the agent that owes it -- what that agent is doing and how far along the task
+is), and a per-agent status for both ends straight from Herdr (`working`, `idle`, `blocked`,
+`done`), each painted in its tool's own colour. The end that owes the next step is lit and the other is dimmed, which is how the
+board says whose move it is: a bright band travels along the name of the end that owes the
+next step, and the other name is dimmed.
 `START` (task start), `PREV` (previous node start; the first node falls back to `START`), state start time,
 state duration, next retry, retry count, and errors. Active tasks appear first; each group is ordered by
 the newest current node start time.
@@ -112,10 +122,11 @@ The board is interactive and can act on tasks, not just display them:
 
 | Key | Action |
 |---|---|
-| `↓` / `↑`, `j` / `k` | move the cursor |
+| `↓` / `↑` | move the cursor |
 | `space` | toggle the cursor row's checkbox |
 | `a` | select all / none |
 | `r` | re-send the stored prompt to the Targets of the checked tasks |
+| `s` | have Jev re-score every open task |
 | `d` | delete the checked tasks — asks for confirmation first |
 | `y`, `Enter` | confirm the pending delete; any other key cancels it |
 | `t` | start or stop the daemon, after a confirmation |
@@ -155,6 +166,15 @@ Protocol reminders default to 30 seconds. Execution and review backoff default t
 8 minutes and cap at 8 hours. If an expected Agent is `working`, the daemon first uses
 `herdr agent wait <agent> --until idle`; that wait time is outside the backoff timer.
 
+The daemon skips a reminder when the target pane is focused or its current Herdr detection
+snapshot contains an interruption marker. These skips do not consume retries; reminders resume
+after the pane is no longer focused and the marker is gone. When Jev is configured it also
+holds a reminder back for work that is still visibly running.
+
+A reminder names the exact command that is outstanding. Answer it with that command. None
+goes out while your pane is `blocked` -- an approval prompt is you being asked something, and
+herdr refuses a prompt to a blocked pane anyway.
+
 If a pane moves or its terminal identity disappears, the task is marked absent. Re-select
 the Target and send a new task; the service does not migrate it automatically.
 
@@ -162,7 +182,7 @@ the Target and send a new task; the service does not migrate it automatically.
 
 A command that would move a closed task (`finished`, `rejected`, `cancelled`, `timeout`,
 `*_absent`) back into the live set is refused, with a non-zero exit and a message naming the
-current state. This covers `take`, `progress`, `done`, `done-implicit` and `reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
+current state. This covers `take`, `done`, `done-implicit` and `reject`. Without the guard, an agent obeying a stale reminder would set a finished task back
 to `active`, redo the work, overwrite the saved result and notify the Source a second time.
 
 `claim` is deliberately idempotent: it lands on `finished`, so re-running it is a
