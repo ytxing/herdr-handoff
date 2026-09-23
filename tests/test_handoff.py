@@ -849,6 +849,56 @@ class JevTests(HandoffTestBase):
         time.sleep(0.35)
         self.assertEqual(self.handoff.jev_wait_left(), 0.0, "and then it is over")
 
+    def test_a_review_that_outlives_its_node_writes_nothing(self):
+        """The request takes seconds; a task can move inside that window.
+
+        `transition()` clears the scores because a new state restarts the node's story. An
+        unconditional write when the answer arrives would put the old node's answers back on
+        the new one.
+        """
+        c = self.seed_open_tasks()
+        c.execute("update tasks set target_stage='working', target_phase='4.0' where id='t_open1'")
+        c.commit()
+        real_ask = self.handoff.jev_ask
+
+        def ask_then_move(*args, **kwargs):
+            # the Target runs `done` while the review is in flight
+            self.handoff.transition(c, "t_open1", "result_ready", "claim", "done")
+            return real_ask(*args, **kwargs)
+
+        stub = JevStub({"t_open1": {"type": "score", "score": 9.0},
+                        "t_open1_state": {"type": "choice", "choice": "done"},
+                        "t_open2": {"type": "score", "score": 3.0},
+                        "t_open2_state": {"type": "choice", "choice": "working"}})
+        stub.activate()
+        try:
+            with patch.object(self.handoff, "jev_ask", side_effect=ask_then_move):
+                self.handoff.jev_score_all(c)
+        finally:
+            stub.stop()
+        row = dict(c.execute("select * from tasks where id='t_open1'").fetchone())
+        self.assertIsNone(row["target_phase"], "the answer belonged to the node that left")
+        self.assertIsNone(row["target_stage"])
+        # The ball moved to the Source with the transition, so the stage answer would land on
+        # the other column -- and it still does not, because the guard is the state, not the sid
+        self.assertIsNone(row["source_stage"], "a stale answer lands nowhere, not on the new node")
+        row2 = dict(c.execute("select * from tasks where id='t_open2'").fetchone())
+        self.assertEqual((row2["source_stage"], row2["source_phase"]), ("working", "3.0"),
+                         "the task that did not move is written as usual")
+
+    def test_a_choice_answer_of_the_wrong_type_fails_the_request(self):
+        """`v not in criteria` raises on a list; the contract is None, not a traceback."""
+        stub = JevStub({"q": {"type": "choice", "choice": ["working"]}})
+        stub.activate()
+        try:
+            q = {"q": {"type": "choice", "instructions": "i", "criteria": {"working": "d"}}}
+            self.assertIsNone(self.handoff.jev_ask({}, q),
+                              "a malformed answer fails the whole request")
+            self.assertEqual(self.handoff.jev_ask({}, q, partial=True),
+                             {}, "and is simply skipped in partial mode")
+        finally:
+            stub.stop()
+
     def test_a_stray_key_cannot_reach_the_live_endpoint(self):
         """A test that turns Jev on without a stubbed URL must fail locally, not call out.
 

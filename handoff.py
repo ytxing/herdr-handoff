@@ -344,7 +344,9 @@ def jev_ask(state, questions, partial=False):
             out[qid] = float(v)
         elif q["type"] == "choice":
             v = a.get("choice")
-            if v not in q["criteria"]:
+            # Not just membership: a list here would raise out of jev_ask, and the contract is
+            # that any malformed answer fails the request instead.
+            if not isinstance(v, str) or v not in q["criteria"]:
                 if partial: continue
                 return None
             out[qid] = v
@@ -640,11 +642,6 @@ def daemon(a):
                 # test or an older store wrote by hand -- would never look due.
                 due_at = r["next_prompt_at"] or now()
                 reminder_due = time.time() >= datetime.fromisoformat(due_at).timestamp()
-                snapshot, answers = None, None
-                if jev_enabled() and reminder_due:
-                    snapshot = agent_read(ag)
-                    if snapshot and snapshot.strip():
-                        answers = jev_ask(_jev_state(r, snapshot), JEV_QUESTIONS)
                 c.execute("update tasks set source_lifecycle=?, source_presence=?,"
                           " target_lifecycle=?, target_presence=? where id=?",
                           (lives["source"][0], lives["source"][1],
@@ -664,6 +661,17 @@ def daemon(a):
                              "--timeout",str(AGENT_WAIT_SLICE_MS),
                              timeout=AGENT_WAIT_SLICE_MS/1000.0 + 5) is None:
                         continue      # still working; the next sweep re-checks the stop file
+                    # The wait lasted a whole slice, and what ended it is the agent going idle
+                    # -- which is also what happens when someone presses Escape in that pane.
+                    # Both guards that exist for that moment (focus, interruption marker) read
+                    # the agent again here, because what they would be judging is older than
+                    # the window they are meant to cover.
+                    lifecycle, present, focused = agent_lifecycle(ag)
+                    c.execute("update tasks set %s_lifecycle=?, %s_presence=? where id=?"
+                              % (side, side), (lifecycle, present, r["id"])); c.commit()
+                    if present == "absent":
+                        transition(c, r["id"], "target_absent" if side == "target" else "source_absent",
+                                   "none", error="Herdr Agent absent"); continue
                 # The agent may have completed the action while the status query or wait was
                 # in progress. Re-read before prompting so a stale row cannot send the old
                 # command after `done`, `claim`, or another transition.
@@ -683,10 +691,18 @@ def daemon(a):
                 if focused:
                     continue
                 if reminder_due:
+                    # Asked here and not earlier: a request costs a five-second floor for the
+                    # whole process, so one spent on a task this sweep has already decided to
+                    # skip (absent, still working, focused) would block the next task's ask and
+                    # force its reminder out unjudged.
+                    snapshot, answers = None, None
+                    if jev_enabled():
+                        snapshot = agent_read(ag)
+                        if snapshot and snapshot.strip():
+                            answers = jev_ask(_jev_state(r, snapshot), JEV_QUESTIONS)
                     # The send/hold-off judgment lives in decide_reminder: interruption markers
-                    # first, then Jev's hold_off. The answers fetched above are passed along,
-                    # so a due reminder does not trigger a second request. None means hold off
-                    # this sweep; like the focus skip above, holding off does not spend a retry.
+                    # first, then Jev's hold_off. None means hold off this sweep; like the focus
+                    # skip above, holding off does not spend a retry.
                     kw = {"snapshot": snapshot, "answers": answers} if snapshot is not None else {}
                     text = decide_reminder(r, ag, **kw)
                     if text is None:
@@ -1377,6 +1393,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         here = start + idx == cursor
         ds = ("closed",) if i["closed"] else ()
         nxt, ns = next_cell(i)
+        if i["closed"]: ns = ds          # the one cell every closed row has is not left faint
         picked = i["id"] in selected
         glyph = ">" if here else ("▸" if i["mine"] else " ")
         box = "[x]" if picked else "[ ]"
@@ -1637,13 +1654,19 @@ def jev_score_all(c):
     answers = jev_ask(review_state(rows, snapshots), review_questions(rows), partial=True)
     scored = {}
     for r in rows:
+        # `and state=?` because the request takes seconds: a `take`, `done` or `claim` from an
+        # agent pane in that window moves the task to a new node, whose own transition just
+        # cleared the columns -- and an unconditional write here would put the answers judged
+        # against the old node back onto the new one.
         text = jev_score_text((answers or {}).get(r["id"]))
         if text is not None:
-            c.execute("update tasks set %s_phase=? where id=?" % actor_side(r), (text, r["id"]))
+            c.execute("update tasks set %s_phase=? where id=? and state=?" % actor_side(r),
+                      (text, r["id"], r["state"]))
             scored[r["id"]] = text
         stage = (answers or {}).get("%s_state" % r["id"])
         if stage in JEV_STATE_OPTIONS:
-            c.execute("update tasks set %s_stage=? where id=?" % actor_side(r), (stage, r["id"]))
+            c.execute("update tasks set %s_stage=? where id=? and state=?" % actor_side(r),
+                      (stage, r["id"], r["state"]))
     c.commit()
     return scored, len(rows) - len(scored)
 
