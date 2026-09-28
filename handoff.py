@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Small, dependency-free Herdr handoff coordinator."""
-import argparse, fcntl, json, os, re, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
+import argparse, fcntl, json, math, os, re, select, shutil, sqlite3, subprocess, sys, termios, time, unicodedata, uuid
 # urllib.request is deliberately absent: it costs ~37ms to import, a third of the
 # time a `handoff take` spends starting up, and only jev_ask ever needs it.
 from datetime import datetime, timezone
@@ -12,9 +12,9 @@ CLI = str(Path(__file__).resolve())
 PROTOCOL_ACK_TIMEOUT = int(os.environ.get("HANDOFF_PROTOCOL_ACK_TIMEOUT", "30"))
 PROTOCOL_ACK_RETRIES = int(os.environ.get("HANDOFF_PROTOCOL_ACK_RETRIES", "3"))
 EXECUTION_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_INITIAL", "120"))
-EXECUTION_BACKOFF_MAX = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_MAX", "28800"))
+EXECUTION_BACKOFF_MAX = int(os.environ.get("HANDOFF_EXECUTION_BACKOFF_MAX", "3600"))
 REVIEW_BACKOFF_INITIAL = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_INITIAL", "120"))
-REVIEW_BACKOFF_MAX = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_MAX", "28800"))
+REVIEW_BACKOFF_MAX = int(os.environ.get("HANDOFF_REVIEW_BACKOFF_MAX", "3600"))
 SWEEP_SECONDS = float(os.environ.get("HANDOFF_SWEEP_SECONDS", "2"))
 AGENT_WAIT_SLICE_MS = int(os.environ.get("HANDOFF_AGENT_WAIT_SLICE_MS", "3000"))
                                     # see the note on the agent wait inside daemon()
@@ -23,7 +23,8 @@ INTERRUPTION_MARKERS = ("Conversation interrupted", "Request interrupted by user
 
 # ---------- Jev (TypeSafe System One) ----------
 # Jev supplies two judgments herdr cannot give: whether a due reminder should be held back,
-# and -- on demand from the board -- how far each open task has actually got. It never moves
+# and how far each open task has got, either at a due reminder or on demand from the board.
+# It never moves
 # a task between states: every transition still comes from an explicit handoff command.
 JEV_URL = os.environ.get("TYPESAFE_API_URL", "https://api.typesafe.ai/v1/systemone")
 JEV_MODEL = os.environ.get("TYPESAFE_MODEL", "jev-latest")
@@ -60,7 +61,8 @@ def conn():
       source_pane text not null, target_pane text not null, state text not null, action text not null,
       state_since text not null, task_started_at text, previous_node_started_at text,
       last_prompt_at text, next_prompt_at text,
-      retry_count integer not null default 0, result_file text, last_action text,
+      retry_count integer not null default 0, backoff_step integer not null default 0,
+      result_file text, last_action text,
       last_action_at text, error text, source_lifecycle text, target_lifecycle text,
       source_presence text, target_presence text, source_phase text, target_phase text,
       source_stage text, target_stage text)""")
@@ -82,6 +84,12 @@ def conn():
             try: c.execute("alter table tasks add column %s text" % phase_column)
             except sqlite3.OperationalError as error:
                 if "duplicate column name" not in str(error): raise
+    if "backoff_step" not in columns:
+        try: c.execute("alter table tasks add column backoff_step integer not null default 0")
+        except sqlite3.OperationalError as error:
+            if "duplicate column name" not in str(error): raise
+        if "retry_count" in columns:
+            c.execute("update tasks set backoff_step=retry_count")
     # A legacy row has no creation timestamp. Its first observed state is the closest truthful
     # value, and makes the new column useful immediately after opening an old store.
     c.execute("update tasks set task_started_at=state_since where task_started_at is null")
@@ -102,16 +110,24 @@ def conn():
     return c
 def transition(c, tid, state, action, last_action=None, error=None):
     stamp = now()
+    initial_delay = (EXECUTION_BACKOFF_INITIAL if state == "active" else
+                     PROTOCOL_ACK_TIMEOUT if state == "result_ready" else None)
+    next_prompt_at = (datetime.fromtimestamp(time.time() + initial_delay, timezone.utc).isoformat()
+                      if initial_delay is not None else None)
     # A new state restarts the node's story, so any Jev completion score filed under the old
     # one goes with it -- the daemon re-judges on its next due cycle. A command that repeats
     # the state the task is already in leaves the score alone: the node has not changed.
     c.execute("update tasks set state=?,action=?,previous_node_started_at=state_since,state_since=?,"
-              "last_action=?,last_action_at=?,error=?,retry_count=0,"
+              "last_action=?,last_action_at=?,error=?,"
+              "retry_count=case when state=? and action=? then retry_count else 0 end,"
+              "backoff_step=case when state=? and action=? then backoff_step else 0 end,"
+              "next_prompt_at=case when state=? and action=? then next_prompt_at else ? end,"
               "source_phase=case when state=? then source_phase else null end,"
               "target_phase=case when state=? then target_phase else null end,"
               "source_stage=case when state=? then source_stage else null end,"
               "target_stage=case when state=? then target_stage else null end where id=?",
               (state,action,stamp,last_action or action,stamp,error,
+               state,action,state,action,state,action,next_prompt_at,
                state,state,state,state,tid)); c.commit()
 def herdr(*args, timeout=20):
     try:
@@ -263,9 +279,7 @@ JEV_SCORE_LEVELS = [
     "Finished: the task's result is complete.",
 ]
 JEV_SCORE_MAX = len(JEV_SCORE_LEVELS) - 1
-# The daemon asks exactly one thing per sweep: whether this reminder should be held back.
-# Scoring is not a background activity -- it is asked for on demand from the board, over a
-# richer state (see jev_score_all), so a score is never silently rewritten under the user.
+# A due reminder asks for its delivery decision and an updated board reading together.
 JEV_QUESTIONS = {
     "hold_off": {
         "type": "noul",
@@ -279,6 +293,26 @@ JEV_QUESTIONS = {
             "false": "The turn ended without the task being reported, and the agent is "
                      "idle, done, or busy with something unrelated to this task."}},
 }
+
+def reminder_delay_question(row, default_delay):
+    """Ask Jev to choose an explicit backoff interval or preserve the current deadline."""
+    return {
+        "type": "choice",
+        "instructions": "For task `%s`, choose the next execution reminder interval. The "
+                        "chosen interval also sets the future backoff tier: after 8m, later "
+                        "reminders follow 16m, 32m, 60m, then stay at 60m. Choose keep to "
+                        "preserve both the current deadline and current tier."
+                        % row["id"],
+        "criteria": {
+            "2m": "Remind in 2m, then continue 4m, 8m, 16m, 32m, 60m.",
+            "4m": "Remind in 4m, then continue 8m, 16m, 32m, 60m.",
+            "8m": "Remind in 8m, then continue 16m, 32m, 60m.",
+            "16m": "Remind in 16m, then continue 32m, 60m.",
+            "32m": "Remind in 32m, then continue 60m.",
+            "60m": "Remind in 60m and continue at 60m.",
+            "keep": "Keep the current deadline and backoff tier unchanged.",
+        },
+    }
 
 def state_question(row):
     """What the agent that owes the next step is doing, or why it is not doing anything.
@@ -308,9 +342,8 @@ def jev_ask(state, questions, partial=False):
 
     The return type is deliberately flat: a noul comes back as a float, a choice as the
     chosen option key, a score as a number. Any malformed or missing answer fails the whole
-    request -- for the daemon's reminder decision a half-parsed judgment would be worse than
-    the fallback path it replaces. `partial=True` is for the board's batch review, where the
-    questions are independent per task and scoring the ones that came back beats scoring none.
+    request. `partial=True` keeps independent answers from the board's batch review or a
+    reminder request when another question has no answer.
     """
     import urllib.request          # ~37ms, and only the Jev paths ever pay it
     key = os.environ.get("TYPESAFE_API_KEY")
@@ -388,8 +421,8 @@ def decide_reminder(row, agent, snapshot=_UNSET, answers=_UNSET):
     answers one question -- hold_off: the user deliberately ended the turn, or the agent is
     visibly working on the task (a background simulation it is monitoring counts, which is
     exactly the case Herdr's lifecycle cannot see once the turn ends). The reminder text
-    itself is always the standard one. The daemon passes its combined answer set in so a
-    sweep never pays for two requests; on any Jev failure the standard reminder goes out,
+    itself is always the standard one. The daemon passes the snapshot it already read, so a
+    due reminder never pays for two reads; on any Jev failure the standard reminder goes out,
     since the markers have already had their say.
     """
     if snapshot is _UNSET: snapshot = agent_read(agent)
@@ -398,7 +431,7 @@ def decide_reminder(row, agent, snapshot=_UNSET, answers=_UNSET):
     if jev_enabled() and snapshot and snapshot.strip():
         if answers is _UNSET:
             answers = jev_ask(_jev_state(row, snapshot), JEV_QUESTIONS)
-        if answers is not None and answers["hold_off"] >= JEV_SUPPRESS_THRESHOLD:
+        if answers is not None and answers.get("hold_off", 0) >= JEV_SUPPRESS_THRESHOLD:
             return None
     return reminder_text(row, row["action"])
 
@@ -483,8 +516,58 @@ def reminder_text(row, action):
     command = REMINDER_COMMAND.get(action, "python3 {cli} {action} {id}").format(
         cli=CLI, id=row["id"], action=action)
     why = REMINDER_WHY.get(action, "This task is waiting on you.")
-    return ("[HANDOFF REMINDER]\nTask ID: {id}\nDescription: {desc}\n\n{why}\n\nRun:\n{cmd}"
-            ).format(id=row["id"], desc=row["description"], why=why, cmd=command)
+    confirm = ("Before running it, confirm the current task state, why you are idle or waiting, "
+               "what background task or external condition you are waiting for, and when you "
+               "expect it to finish or next change.\n\nRun:")
+    return ("[HANDOFF REMINDER]\nTask ID: {id}\nDescription: {desc}\n\n{why}\n\n{confirm}\n{cmd}"
+            ).format(id=row["id"], desc=row["description"], why=why, confirm=confirm, cmd=command)
+
+def schedule_next_reminder(c, row, delivered, delay=None, advance_backoff=True):
+    if row["state"] in ("published", "result_ready"):
+        delay = PROTOCOL_ACK_TIMEOUT
+    elif delay is None:
+        delay = min(EXECUTION_BACKOFF_MAX,
+                    EXECUTION_BACKOFF_INITIAL * (2 ** row["backoff_step"]))
+    due = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat()
+    step_update = "backoff_step=backoff_step+1" if advance_backoff else "backoff_step=backoff_step"
+    if delivered:
+        c.execute(("update tasks set last_prompt_at=?,next_prompt_at=?,"
+                   "retry_count=retry_count+1,%s where id=? and state=? and action=?") % step_update,
+                  (now(), due, row["id"], row["state"], row["action"]))
+    else:
+        c.execute(("update tasks set next_prompt_at=?,%s where id=? and state=? and action=?") % step_update,
+                  (due, row["id"], row["state"], row["action"]))
+    c.commit()
+
+def advised_reminder_delay(row, answers, answer_key="next_remind"):
+    """Resolve an explicit Jev interval, falling back to the normal backoff."""
+    default = min(EXECUTION_BACKOFF_MAX,
+                  EXECUTION_BACKOFF_INITIAL * (2 ** row["backoff_step"]))
+    choice = (answers or {}).get(answer_key)
+    return {"2m": 2 * 60, "4m": 4 * 60, "8m": 8 * 60,
+            "16m": 16 * 60, "32m": 32 * 60, "60m": 60 * 60}.get(choice, default)
+
+def reminder_choice_step(answers, answer_key="next_remind"):
+    return {"2m": 0, "4m": 1, "8m": 2, "16m": 3, "32m": 4, "60m": 5}.get(
+        (answers or {}).get(answer_key))
+
+def set_reminder_backoff_step(c, row, answers, answer_key="next_remind"):
+    step = reminder_choice_step(answers, answer_key)
+    if step is not None:
+        c.execute("update tasks set backoff_step=? where id=? and state=? and action=?",
+                  (step, row["id"], row["state"], row["action"]))
+
+def apply_reminder_advice(c, row, answers, answer_key="next_remind"):
+    """Apply a Jev delay answer without counting a delivery or advancing backoff."""
+    if row["action"] not in REMINDER_RECIPIENT or row["state"] in ("published", "result_ready"):
+        return
+    if (answers or {}).get(answer_key) == "keep":
+        return
+    set_reminder_backoff_step(c, row, answers, answer_key)
+    delay = advised_reminder_delay(row, answers, answer_key)
+    due = datetime.fromtimestamp(time.time() + delay, timezone.utc).isoformat()
+    c.execute("update tasks set next_prompt_at=? where id=? and state=? and action=?",
+              (due, row["id"], row["state"], row["action"]))
 
 def cmd_send(a):
     if not a.description.strip(): raise SystemExit("description must not be empty")
@@ -633,10 +716,8 @@ def daemon(a):
                          for end in ("source", "target")}
                 lifecycle, present, focused = lives[recipient]
                 side = recipient
-                # The sweep's one Jev request is the reminder judgment and nothing else.
-                # Neither the score nor the idle reason is written here: both are written by
-                # the board's review key, so what is on screen is what somebody asked for and
-                # it stays put until the task moves state or the review runs again.
+                # The sweep refreshes the board reading only when this task is due for a
+                # reminder; routine lifecycle checks do not ask Jev.
                 # The fallback is resolved first: `time.time() >= ... or now()` would call
                 # now() AFTER reading the clock, so a row with no next_prompt_at -- one a
                 # test or an older store wrote by hand -- would never look due.
@@ -691,26 +772,41 @@ def daemon(a):
                 if focused:
                     continue
                 if reminder_due:
-                    # Asked here and not earlier: a request costs a five-second floor for the
-                    # whole process, so one spent on a task this sweep has already decided to
-                    # skip (absent, still working, focused) would block the next task's ask and
-                    # force its reminder out unjudged.
-                    snapshot, answers = None, None
-                    if jev_enabled():
-                        snapshot = agent_read(ag)
-                        if snapshot and snapshot.strip():
-                            answers = jev_ask(_jev_state(r, snapshot), JEV_QUESTIONS)
-                    # The send/hold-off judgment lives in decide_reminder: interruption markers
-                    # first, then Jev's hold_off. None means hold off this sweep; like the focus
-                    # skip above, holding off does not spend a retry.
-                    kw = {"snapshot": snapshot, "answers": answers} if snapshot is not None else {}
-                    text = decide_reminder(r, ag, **kw)
-                    if text is None:
+                    snapshot = agent_read(ag)
+                    if snapshot is not None and has_interruption_marker(snapshot):
                         continue
                     retries = r["retry_count"]
                     protocol = r["state"] in ("published", "result_ready")
                     if protocol and retries >= PROTOCOL_ACK_RETRIES:
                         transition(c, r["id"], "timeout", "none", error="protocol acknowledgement timeout")
+                        continue
+                    # The reminder decision, reading, and next-delay advice share one task
+                    # snapshot and one HTTP request.
+                    answers = None
+                    default_delay = (min(EXECUTION_BACKOFF_MAX,
+                                         EXECUTION_BACKOFF_INITIAL * (2 ** fresh["backoff_step"]))
+                                     if not protocol else PROTOCOL_ACK_TIMEOUT)
+                    if jev_enabled() and snapshot and snapshot.strip():
+                        questions = {**JEV_QUESTIONS,
+                                     **review_questions([fresh], include_reminder=False)}
+                        if not protocol:
+                            questions["next_remind"] = reminder_delay_question(fresh, default_delay)
+                        answers = jev_ask(review_state([fresh], {fresh["id"]: snapshot}),
+                                          questions, partial=True)
+                    text = decide_reminder(fresh, ag, snapshot=snapshot, answers=answers)
+                    latest = c.execute("select * from tasks where id=?", (r["id"],)).fetchone()
+                    if not latest or latest["state"] != r["state"] or latest["action"] != r["action"]:
+                        continue
+                    store_jev_reading(c, fresh, answers)
+                    # An explicit interval becomes the starting tier for subsequent backoff;
+                    # `keep` leaves the existing tier untouched.
+                    set_reminder_backoff_step(c, fresh, answers)
+                    c.commit()
+                    if text is None:
+                        keep_delay = (answers or {}).get("next_remind") == "keep"
+                        schedule_next_reminder(c, fresh, delivered=False,
+                                               delay=advised_reminder_delay(fresh, answers),
+                                               advance_backoff=not keep_delay)
                         continue
                     if prompt(ag, text) is None:
                         # herdr refuses a prompt to a pane that went blocked between the status
@@ -718,11 +814,10 @@ def daemon(a):
                         # so this is not an attempt: counting it would age the task toward a
                         # timeout with no reminder behind it.
                         continue
-                    if protocol:
-                        delay = PROTOCOL_ACK_TIMEOUT
-                    else:
-                        delay = min(EXECUTION_BACKOFF_MAX, EXECUTION_BACKOFF_INITIAL * (2 ** retries))
-                    c.execute("update tasks set last_prompt_at=?,next_prompt_at=?,retry_count=retry_count+1 where id=?",(now(),datetime.fromtimestamp(time.time()+delay,timezone.utc).isoformat(),r['id'])); c.commit()
+                    keep_delay = (answers or {}).get("next_remind") == "keep"
+                    schedule_next_reminder(c, fresh, delivered=True,
+                                           delay=advised_reminder_delay(fresh, answers),
+                                           advance_backoff=not keep_delay)
             time.sleep(SWEEP_SECONDS)
     finally:
         # Only remove the pid file if it still names this process. Deleting it blind let a
@@ -1089,14 +1184,11 @@ def board_items():
         actor = r["target_pane"] if to_target else r["source_pane"]
         actor_pane = r["target_pane"] if to_target else r["source_pane"]
         task_started_at = r["task_started_at"] or r["state_since"]
-        previous_node_started_at = r["previous_node_started_at"] or task_started_at
         node_started_at = r["state_since"] or task_started_at
         state_started_at = datetime.fromisoformat(r["state_since"])
         if r["state"] in CLOSED_STATES:
-            # A terminal row is no longer active, so its state duration ends at the transition
-            # that closed it. Legacy rows without last_action_at use state_since and show 0s.
-            age_end = datetime.fromisoformat(r["last_action_at"] or r["state_since"])
-            age_seconds = age_end.timestamp() - state_started_at.timestamp()
+            # Terminal AGE is the finished task's total duration, frozen at closure.
+            age_seconds = (state_started_at - datetime.fromisoformat(task_started_at)).total_seconds()
         else:
             age_seconds = time.time() - state_started_at.timestamp()
         items.append({
@@ -1117,7 +1209,7 @@ def board_items():
             "age": _human_age(age_seconds),
             "since": node_started_at,
             "task_start": _display_time(task_started_at),
-            "previous_node_start": _display_time(previous_node_started_at),
+            "next_prompt_at": r["next_prompt_at"],
         })
     # Active tasks come first. Within each group, the task whose current node started most
     # recently comes first, so the board's top rows reflect the latest activity.
@@ -1140,6 +1232,15 @@ def _legend_segments():
 
 BOARD_CHROME = 6      # title, rule, column header, blank, message line, legend
 
+def reminder_countdown(due_at, current_time):
+    if not due_at: return "due"
+    remaining = math.ceil(datetime.fromisoformat(due_at).timestamp() - current_time)
+    if remaining <= 0: return "due"
+    hours, rest = divmod(remaining, 3600)
+    minutes, seconds = divmod(rest, 60)
+    if hours > 99: return ">99h"
+    return "%02d:%02d:%02d" % (hours, minutes, seconds)
+
 def render_board(width=100, selected=None, cursor=None, statuses=None, items=None,
                  message=None, height=None, tabs=None):
     selected = selected or frozenset()
@@ -1149,6 +1250,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     frame_width = max(1, width)
     scrollbar_width = 1 if frame_width > 1 and items else 0
     content_width = frame_width - scrollbar_width
+    frame_now = time.time()
     for i in items:
         i["src_status"] = _lookup_status(statuses, i["src_agent"], i["src_pane"])
         i["dst_status"] = _lookup_status(statuses, i["dst_agent"], i["dst_pane"])
@@ -1169,8 +1271,10 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         # keeps the renderer's contract independent of that migration detail.
         task_started_at = i.get("task_started_at") or i.get("since")
         i["task_start"] = i.get("task_start") or _display_time(task_started_at)
-        i["previous_node_start"] = i.get("previous_node_start") or _display_time(
-            i.get("previous_node_started_at") or task_started_at)
+        # Only pending actions in the daemon's reminder map can produce a reminder. Other
+        # records keep the column width but leave the cell empty.
+        i["remind"] = (reminder_countdown(i.get("next_prompt_at"), frame_now)
+                       if i["action"] in REMINDER_RECIPIENT else "")
 
     def next_cell(i):
         if i["action"] == "none": return "—", ("dim",)
@@ -1212,7 +1316,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     ksn = widest("SRC", [name_of(i,"src") for i in items])
     kdn = widest("DST", [name_of(i,"dst") for i in items])
     kts = widest("START", [i["task_start"] for i in items])
-    kpn = widest("PREV", [i["previous_node_start"] for i in items])
+    krm = 8
 
     def status_cell(i, which, dim):
         """(plain, segments) for one SRC/DST cell.
@@ -1266,10 +1370,10 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
     kdf = widest("DST", [status_cell(i,"dst",False)[0] for i in items])
 
     # Narrowing ladder: keep the operational columns visible first, then drop routing, action,
-    # and finally the two timestamps. Every removed optional column is accounted for by fixed(),
+    # and finally the two right-hand columns. Every removed optional column is accounted for by fixed(),
     # so the description never consumes space reserved by a column on the right.
     routing, show_action = "full", True
-    show_task_start, show_previous_node_start = True, True
+    show_task_start, show_remind = True, True
     MIN_DESC = 12
     def routing_w():
         if routing == "full":  return ksf + kdf
@@ -1284,14 +1388,14 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         count = 5 + routing_count()       # MARK, ID, DESCRIPTION, STATE, AGE
         if show_action: widths += knx; count += 1
         if show_task_start: widths += kts; count += 1
-        if show_previous_node_start: widths += kpn; count += 1
+        if show_remind: widths += krm; count += 1
         return widths + 2 * (count - 1)
     while content_width - fixed() < MIN_DESC:
         if routing == "full": routing = "names"
         elif routing == "names": routing = "route"
         elif show_action: show_action = False
         elif routing == "route": routing = "none"
-        elif show_previous_node_start: show_previous_node_start = False
+        elif show_remind: show_remind = False
         elif show_task_start: show_task_start = False
         else: break
     desc_w = max(1, content_width - fixed())
@@ -1333,7 +1437,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if routing == "route": return [(i["route"], dim, krt, "l")]
         return []
 
-    def assemble(mark, _id, desc, state, nxt, age, task_start, previous_node_start,
+    def assemble(mark, _id, desc, state, nxt, age, task_start, remind,
                  ms, ds, ss, ns, as_, ts, ps, i=None, header=False, bg=()):
         cells = [(mark, ms, MARK_W, "l"), (_id, ds, kid, "l"), (desc, ds, desc_w, "l")]
         cells.append((state, ss, kst, "l"))
@@ -1341,7 +1445,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if show_action: cells.append((nxt, ns, knx, "l"))
         cells.append((age, as_, kag, "r"))
         if show_task_start: cells.append((task_start, ts, kts, "l"))
-        if show_previous_node_start: cells.append((previous_node_start, ps, kpn, "l"))
+        if show_remind: cells.append((remind, ps, krm, "r"))
         return row(cells, bg)
 
     n = len(items)
@@ -1384,7 +1488,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
              + " " * max(1, content_width - used - len(clock)) + _paint(clock, "dim"),
              _paint("─" * max(1, content_width), "dim")]
     lines.append(assemble("", "ID", "DESCRIPTION", "STATE", "PROCESS", "AGE",
-                          "START", "PREV",
+                          "START", "REMIND",
                           ("dim",), ("dim",), ("dim",), ("dim",), ("dim",),
                           ("dim",), ("dim",), header=True))
     if not items:
@@ -1403,7 +1507,7 @@ def render_board(width=100, selected=None, cursor=None, statuses=None, items=Non
         if i["closed"] and "red" not in state_style: state_style = ds
         lines.append(assemble(glyph + box, i["id"], _fit(i["desc"], desc_w),
                               i["state"], nxt, i["age"], i["task_start"],
-                              i["previous_node_start"], ms, ds,
+                              i["remind"], ms, ds,
                               state_style, ns, ds, ds, ds, i=i, bg=bg))
         row_backgrounds.append(bg)
     # The last two lines are fixed furniture: the message line, then the key legend.
@@ -1610,11 +1714,17 @@ def review_state(rows, snapshots):
     the side the score is about, and the only one whose idleness says anything about the task.
     The prompt is truncated to keep the request bounded.
     """
-    return {"now": now(), "tasks": [
+    observed_at = now()
+    observed_epoch = time.time()
+    return {"now": observed_at, "tasks": [
         {"id": r["id"], "description": r["description"],
          "prompt": r["prompt"][:JEV_PROMPT_CHARS],
          "state": r["state"], "pending_action": r["action"],
          "task_started_at": r["task_started_at"],
+         "current_time": observed_at,
+         "next_prompt_at": r["next_prompt_at"],
+         "remind_seconds": (max(0, datetime.fromisoformat(r["next_prompt_at"]).timestamp() - observed_epoch)
+                            if r["next_prompt_at"] else None),
          "state_since": r["state_since"],
          "previous_node_started_at": r["previous_node_started_at"],
          "last_action": r["last_action"], "last_action_at": r["last_action_at"],
@@ -1626,8 +1736,8 @@ def review_state(rows, snapshots):
          "agent_terminal_snapshot": (snapshots.get(r["id"]) or "")[-JEV_SNAPSHOT_CHARS:]}
         for r in rows]}
 
-def review_questions(rows):
-    """One score and one idle question per task, asked together so the board costs one request."""
+def review_questions(rows, include_reminder=True):
+    """Score, state, and execution reminder advice in one board request."""
     questions = {}
     for r in rows:
         questions[r["id"]] = {
@@ -1640,9 +1750,28 @@ def review_questions(rows):
                             "been sitting on." % (r["id"], r["description"].replace("\n", " ")[:120]),
             "criteria": JEV_SCORE_LEVELS}
         questions["%s_state" % r["id"]] = state_question(r)
+        if (include_reminder and r["action"] in REMINDER_RECIPIENT
+                and r["state"] not in ("published", "result_ready")):
+            key = "%s_next_remind" % r["id"]
+            questions[key] = reminder_delay_question(
+                r, min(EXECUTION_BACKOFF_MAX,
+                       EXECUTION_BACKOFF_INITIAL * (2 ** r["backoff_step"])))
     return questions
 
-def jev_score_all(c):
+def store_jev_reading(c, row, answers):
+    answers = answers or {}
+    side = actor_side(row)
+    text = jev_score_text(answers.get(row["id"]))
+    if text is not None:
+        c.execute("update tasks set %s_phase=? where id=? and state=? and action=?" % side,
+                  (text, row["id"], row["state"], row["action"]))
+    stage = answers.get("%s_state" % row["id"])
+    if stage in JEV_STATE_OPTIONS:
+        c.execute("update tasks set %s_stage=? where id=? and state=? and action=?" % side,
+                  (stage, row["id"], row["state"], row["action"]))
+    return text
+
+def jev_score_all(c, with_readings=False):
     """Score every open task in one Jev request. Returns (scored, unanswered) counts.
 
     Nothing is written when the request fails, so a board with no key configured or a Jev
@@ -1653,31 +1782,45 @@ def jev_score_all(c):
     snapshots = {r["id"]: agent_read(r[actor_side(r) + "_pane"]) or "" for r in rows}
     answers = jev_ask(review_state(rows, snapshots), review_questions(rows), partial=True)
     scored = {}
+    readings = {}
     for r in rows:
-        # `and state=?` because the request takes seconds: a `take`, `done` or `claim` from an
-        # agent pane in that window moves the task to a new node, whose own transition just
-        # cleared the columns -- and an unconditional write here would put the answers judged
-        # against the old node back onto the new one.
-        text = jev_score_text((answers or {}).get(r["id"]))
+        text = store_jev_reading(c, r, answers)
         if text is not None:
-            c.execute("update tasks set %s_phase=? where id=? and state=?" % actor_side(r),
-                      (text, r["id"], r["state"]))
             scored[r["id"]] = text
-        stage = (answers or {}).get("%s_state" % r["id"])
-        if stage in JEV_STATE_OPTIONS:
-            c.execute("update tasks set %s_stage=? where id=? and state=?" % actor_side(r),
-                      (stage, r["id"], r["state"]))
+        key = "%s_next_remind" % r["id"]
+        if answers and key in answers:
+            apply_reminder_advice(c, r, answers, key)
+        side = actor_side(r)
+        readings[r["id"]] = {
+            "stage": (answers or {}).get("%s_state" % r["id"]),
+            "score": text,
+            "next_remind": (answers or {}).get(key),
+            "side": side,
+        }
     c.commit()
-    return scored, len(rows) - len(scored)
+    result = (scored, len(rows) - len(scored))
+    return result + (readings,) if with_readings else result
 
-def review_summary(scored, unanswered):
+def review_summary(scored, unanswered, readings=None):
     """One line for the board: what the review managed, in counts rather than ids."""
     if not scored and not unanswered: return "No open task to score"
     if not scored:
-        return "Jev could not score %d task%s — scores unchanged" % (
+        line = "Jev could not score %d task%s — scores unchanged" % (
             unanswered, "" if unanswered == 1 else "s")
-    line = "Scored %d task%s" % (len(scored), "" if len(scored) == 1 else "s")
-    if unanswered: line += " · %d unanswered" % unanswered
+    else:
+        line = "Scored %d task%s" % (len(scored), "" if len(scored) == 1 else "s")
+        if unanswered: line += " · %d unanswered" % unanswered
+    if readings:
+        parts = []
+        for tid, reading in readings.items():
+            if all(reading.get(k) is None for k in ("score", "stage", "next_remind")):
+                continue
+            stage = reading.get("stage") or "—"
+            score = reading.get("score") or "—"
+            advice = reading.get("next_remind")
+            suffix = (" next=" + advice) if advice else ""
+            parts.append("%s %s %s/9%s" % (tid, stage, score, suffix))
+        if parts: line += " · " + " | ".join(parts)
     return line
 
 def ui(_):
@@ -1763,9 +1906,9 @@ def ui(_):
                              time.time()+3)
                 else:
                     c = conn()
-                    try: scored, unanswered = jev_score_all(c)
+                    try: scored, unanswered, readings = jev_score_all(c, with_readings=True)
                     finally: c.close()
-                    flash = (review_summary(scored, unanswered), time.time()+5)
+                    flash = (review_summary(scored, unanswered, readings), time.time()+5)
             elif key == "d":
                 if not selected: flash = ("Select a task first — ↑↓ moves, space toggles", time.time()+3)
                 else: pending, mode = sorted(selected), "confirm_delete"

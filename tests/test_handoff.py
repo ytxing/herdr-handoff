@@ -739,16 +739,9 @@ class DaemonLifecycleTests(HandoffTestBase):
         self.assertFalse(self.handoff.daemon_running())
         p.wait()
 
-    def test_the_daemon_scores_nothing_on_its_own(self):
-        """Scoring is on demand from the board; the sweep never asks for one.
-
-        A background score would rewrite the number under whoever is reading the board, and
-        a reviewer would have no way to tell their own review from the daemon's guess. The
-        idle reason is the same kind of reading, so the sweep is not allowed to leave one
-        either: both columns move only when the review key is pressed.
-        """
+    def test_due_reminder_updates_the_board_reading_in_one_jev_request(self):
         c = self.db()
-        c.execute(INSERT, ("t_phase", "不自动打分", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+        c.execute(INSERT, ("t_phase", "后台打分", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
                            "active", "done", self.handoff.now()))
         c.commit()
         read_file = Path(self.tmp.name) / "agent-read.txt"
@@ -756,24 +749,54 @@ class DaemonLifecycleTests(HandoffTestBase):
         os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
         os.environ["FAKE_HERDR_STATUS"] = "working"
         stub = JevStub({"hold_off": {"type": "noul", "noul": 0.9},
-                        "work_progress": {"type": "score", "score": 6.4}})
+                        "t_phase": {"type": "score", "score": 6.4},
+                        "t_phase_state": {"type": "choice", "choice": "waiting"},
+                        "next_remind": {"type": "choice", "choice": "60m"}})
         stub.activate()
         p = None
         try:
             p = self.start_daemon()
             self.sweeps(3)
             row = self.db().execute(
-                "select target_phase from tasks where id='t_phase'").fetchone()
-            self.assertIsNone(row[0], "the daemon must not write a score by itself")
-            self.assertTrue(stub.requests)
-            self.assertEqual(set(stub.requests[0]["questions"]), {"hold_off"},
-                             "the sweep asks the reminder question and nothing else")
-            row = self.db().execute(
-                "select target_stage from tasks where id='t_phase'").fetchone()
-            self.assertIsNone(row[0], "and writes no observation of its own")
+                "select target_phase,target_stage,next_prompt_at from tasks where id='t_phase'").fetchone()
+            self.assertEqual(row["target_phase"], "6.4")
+            self.assertEqual(row["target_stage"], "waiting")
+            self.assertGreater(
+                (datetime.fromisoformat(row["next_prompt_at"]) - datetime.now(timezone.utc)).total_seconds(),
+                59 * 60)
+            self.assertEqual(len(stub.requests), 1)
+            self.assertEqual(set(stub.requests[0]["questions"]),
+                             {"hold_off", "t_phase", "t_phase_state", "next_remind"})
+            self.assertEqual(stub.requests[0]["state"]["tasks"][0]["id"], "t_phase")
         finally:
             stub.stop()
             os.environ.pop("FAKE_HERDR_STATUS", None)
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+    def test_missing_hold_off_falls_back_to_reminder_and_keeps_score(self):
+        c = self.db()
+        c.execute(INSERT, ("t_partial", "部分回答", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "active", "done", self.handoff.now()))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("idle after work\n")
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        stub = JevStub({"t_partial": {"type": "score", "score": 7.0},
+                        "t_partial_state": {"type": "choice", "choice": "unreported"}})
+        stub.activate()
+        p = None
+        try:
+            p = self.start_daemon()
+            self.sweeps(2)
+            self.assertIn("wA:pTEST-DST", self.delivered())
+            row = self.db().execute(
+                "select target_phase,target_stage,retry_count from tasks where id='t_partial'").fetchone()
+            self.assertEqual((row["target_phase"], row["target_stage"], row["retry_count"]),
+                             ("7.0", "unreported", 1))
+            self.assertEqual(len(stub.requests), 1)
+        finally:
+            stub.stop()
             os.environ.pop("FAKE_HERDR_READ_FILE", None)
             if p: self.reap(p)
 
@@ -791,21 +814,95 @@ class DaemonLifecycleTests(HandoffTestBase):
         stub.activate()
         p = None
         try:
+            with patch.dict(os.environ, {"HANDOFF_PROTOCOL_ACK_TIMEOUT": "1"}):
+                p = self.start_daemon()
+                self.sweeps(2)
+                self.assertEqual(self.delivered(), [], "a user-ended turn must not be reminded")
+                self.assertEqual(
+                    self.db().execute("select retry_count from tasks where id='t_jevsup'").fetchone()[0],
+                    0, "suppression must not spend a retry")
+                self.assertTrue(stub.requests)
+                self.assertIn("hold_off", stub.requests[0]["questions"])
+
+                stub.answers["hold_off"]["noul"] = 0.05  # the simulation finished; resume
+                deadline = time.monotonic() + 3
+                while "wA:pTEST-JEV" not in self.delivered() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertIn("wA:pTEST-JEV", self.delivered())
+                log = self.prompt_log.read_text()
+                self.assertIn("[HANDOFF REMINDER]", log, "the reminder text is the standard one")
+                self.assertIn(self.handoff.REMINDER_WHY["take"].replace("\n", "\\n"), log)
+        finally:
+            stub.stop()
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+    def test_jev_hold_advances_backoff_without_spending_a_delivery(self):
+        c = self.db()
+        c.execute(INSERT, ("t_backoff", "等待后台工作", "p", "wA:pTEST-SRC",
+                           "wA:pTEST-JEV", "active", "done", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=? where id='t_backoff'", (self.handoff.now(),))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("background command is still running\n")
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        stub = JevStub({"hold_off": {"type": "noul", "noul": 0.97}})
+        stub.activate()
+        p = None
+        try:
+            with patch.dict(os.environ, {"HANDOFF_EXECUTION_BACKOFF_INITIAL": "2"}):
+                p = self.start_daemon()
+                deadline = time.monotonic() + 3
+                while not stub.requests and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(stub.requests, "the due task must reach Jev")
+                self.sweeps()
+                row = dict(self.db().execute(
+                    "select * from tasks where id='t_backoff'").fetchone())
+                self.assertEqual(len(stub.requests), 1)
+                self.assertEqual(row["retry_count"], 0)
+                self.assertEqual(row["backoff_step"], 1)
+                self.assertEqual(self.delivered(), [])
+                self.assertGreater(datetime.fromisoformat(row["next_prompt_at"]),
+                                   datetime.now(timezone.utc))
+                self.sweeps(2)
+                self.assertEqual(len(stub.requests), 1,
+                                 "a held reminder must wait for its next backoff deadline")
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    row = dict(self.db().execute(
+                        "select * from tasks where id='t_backoff'").fetchone())
+                    if row["backoff_step"] >= 2: break
+                    time.sleep(0.05)
+                self.assertEqual(row["backoff_step"], 2)
+                self.assertEqual(row["retry_count"], 0)
+                self.assertEqual(len(stub.requests), 2)
+                self.assertGreater(
+                    (datetime.fromisoformat(row["next_prompt_at"]) -
+                     datetime.now(timezone.utc)).total_seconds(), 3,
+                    "the second hold must advance from two to four seconds")
+        finally:
+            stub.stop()
+            os.environ.pop("FAKE_HERDR_READ_FILE", None)
+            if p: self.reap(p)
+
+    def test_known_interruption_marker_skips_jev(self):
+        c = self.db()
+        c.execute(INSERT, ("t_marker", "中断", "p", "wA:pTEST-SRC", "wA:pTEST-JEV",
+                           "published", "take", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=? where id='t_marker'", (self.handoff.now(),))
+        c.commit()
+        read_file = Path(self.tmp.name) / "agent-read.txt"
+        read_file.write_text("Conversation interrupted\n")
+        os.environ["FAKE_HERDR_READ_FILE"] = str(read_file)
+        stub = JevStub({"hold_off": {"type": "noul", "noul": 0.97}})
+        stub.activate()
+        p = None
+        try:
             p = self.start_daemon()
             self.sweeps(2)
-            self.assertEqual(self.delivered(), [], "a user-ended turn must not be reminded")
-            self.assertEqual(
-                self.db().execute("select retry_count from tasks where id='t_jevsup'").fetchone()[0],
-                0, "suppression must not spend a retry")
-            self.assertTrue(stub.requests)
-            self.assertIn("hold_off", stub.requests[0]["questions"])
-
-            stub.answers["hold_off"]["noul"] = 0.05        # the simulation finished; resume
-            self.sweeps(2)
-            self.assertIn("wA:pTEST-JEV", self.delivered())
-            log = self.prompt_log.read_text()
-            self.assertIn("[HANDOFF REMINDER]", log, "the reminder text is the standard one")
-            self.assertIn(self.handoff.REMINDER_WHY["take"].replace("\n", "\\n"), log)
+            self.assertEqual(stub.requests, [])
+            self.assertEqual(self.delivered(), [])
         finally:
             stub.stop()
             os.environ.pop("FAKE_HERDR_READ_FILE", None)
@@ -981,6 +1078,32 @@ class JevTests(HandoffTestBase):
         row = self.db().execute("select target_phase from tasks where id='t_score'").fetchone()
         self.assertIsNone(row[0])
 
+    def test_a_transition_starts_the_new_reminder_schedule(self):
+        c = self.db()
+        c.execute(INSERT, ("t_clock", "计时", "p", "wA:pTEST-SRC", "wA:pTEST-DST",
+                           "published", "take", self.handoff.now()))
+        c.execute("update tasks set next_prompt_at=?,retry_count=3,backoff_step=8"
+                  " where id='t_clock'", ((datetime.now(timezone.utc) +
+                                           timedelta(hours=8)).isoformat(),))
+        c.commit()
+        for state, action, delay in (("active", "done", self.handoff.EXECUTION_BACKOFF_INITIAL),
+                                     ("result_ready", "claim", self.handoff.PROTOCOL_ACK_TIMEOUT)):
+            self.handoff.transition(c, "t_clock", state, action)
+            row = dict(c.execute("select * from tasks where id='t_clock'").fetchone())
+            remaining = (datetime.fromisoformat(row["next_prompt_at"]) -
+                         datetime.now(timezone.utc)).total_seconds()
+            self.assertLess(abs(remaining - delay), 2, state)
+            self.assertEqual(row["retry_count"], 0)
+            self.assertEqual(row["backoff_step"], 0)
+            c.execute("update tasks set retry_count=2,backoff_step=4 where id='t_clock'")
+            c.commit()
+            due = row["next_prompt_at"]
+            self.handoff.transition(c, "t_clock", state, action)
+            repeated = dict(c.execute("select * from tasks where id='t_clock'").fetchone())
+            self.assertEqual(repeated["next_prompt_at"], due,
+                             "repeating an action must not postpone the same state's reminder")
+            self.assertEqual((repeated["retry_count"], repeated["backoff_step"]), (2, 4))
+
     def test_decide_reminder_falls_back_to_markers_when_jev_fails(self):
         os.environ["TYPESAFE_API_KEY"] = "k"
         marker = "■ Conversation interrupted - tell the model what to do differently."
@@ -1138,6 +1261,22 @@ class JevTests(HandoffTestBase):
         self.assertIn("Scored 2 tasks", line)
         self.assertIn("1 unanswered", line)
         self.assertNotIn("t_", line, "no task ids in the message")
+
+    def test_review_summary_shows_answers_concisely(self):
+        line = self.handoff.review_summary(
+            {"t_a": "6.4"}, 0,
+            {"t_a": {"stage": "waiting", "score": "6.4", "next_remind": "60m"}})
+        self.assertIn("t_a waiting 6.4/9 next=60m", line)
+
+    def test_reminder_choice_sets_the_future_backoff_tier(self):
+        row = {"id": "t_a", "backoff_step": 0}
+        question = self.handoff.reminder_delay_question(row, 120)
+        self.assertEqual(set(question["criteria"]),
+                         {"2m", "4m", "8m", "16m", "32m", "60m", "keep"})
+        self.assertEqual(self.handoff.advised_reminder_delay(row, {"next_remind": "8m"}), 480)
+        self.assertEqual(self.handoff.reminder_choice_step({"next_remind": "8m"}), 2)
+        self.assertIn("16m", question["criteria"]["8m"])
+        self.assertIn("60m", question["criteria"]["8m"])
 
     def test_every_board_key_is_a_single_press(self):
         """Scoring and deleting are plain keys, and no key waits for a second one.
@@ -1487,8 +1626,10 @@ class BoardRenderTests(HandoffTestBase):
 
     def test_inactive_task_age_is_frozen_at_terminal_transition(self):
         c = self.db()
-        c.execute("update tasks set state='finished', action='none', state_since=?, last_action_at=? where id=?",
-                  ("2000-01-01T00:00:00+00:00", "2000-01-01T00:02:00+00:00", "t_cccc555566"))
+        c.execute("update tasks set state='finished', action='none', task_started_at=?, "
+                  "state_since=?, last_action_at=? where id=?",
+                  ("2000-01-01T00:00:00+00:00", "2000-01-01T00:02:00+00:00",
+                   "2000-01-01T00:02:00+00:00", "t_cccc555566"))
         c.commit()
 
         with patch.object(self.handoff.time, "time", return_value=946684800):
@@ -1657,51 +1798,69 @@ class BoardRenderTests(HandoffTestBase):
             self.assertIn("q quit", lines[-1], "the legend is always the last line")
             self.assertEqual(lines[-2], "" if msg is None else "Resent to h2")
 
+    def test_closed_task_age_freezes_at_total_elapsed_time(self):
+        c = self.db()
+        started = "2026-09-24T10:00:00+00:00"
+        finished = "2026-09-24T11:23:00+00:00"
+        c.execute("update tasks set task_started_at=?,state_since=?,last_action_at=? "
+                  "where id='t_cccc555566'", (started, finished, finished))
+        c.commit()
+        item = next(i for i in self.handoff.board_items() if i["id"] == "t_cccc555566")
+        self.assertEqual(item["age"], "1h23m")
+
     def test_columns_shrink_in_ladder_order(self):
         header = lambda w: self.board(w).split("\n")[2]
         self.assertIn("SRC", header(150))
         self.assertIn("DST", header(150))
         self.assertIn("START", header(150))
-        self.assertIn("PREV", header(150))
+        self.assertIn("REMIND", header(150))
         self.assertNotIn("TASK START", header(150))
-        self.assertNotIn("PREV NODE", header(150))
+        self.assertNotIn("PREV", header(150))
         self.assertTrue(any("ROUTE" in header(w) for w in range(150, 42, -1)),
                         "ROUTE must appear as the fallback before routing is dropped entirely")
         self.assertNotIn("working", self.board(43), "status words are the first thing dropped")
         self.assertNotIn("ROUTE", header(43))
         self.assertNotIn("START", header(43))
-        self.assertNotIn("PREV", header(43))
+        self.assertNotIn("REMIND", header(43))
 
-    def test_board_shows_the_task_and_previous_node_start(self):
+    def test_board_shows_task_start_and_live_reminder_countdown(self):
         task_start = "2026-09-16T08:09:00+00:00"
-        previous_start = "2026-09-16T08:10:00+00:00"
+        base = int(time.time())
+        due = datetime.fromtimestamp(base + 65, timezone.utc).isoformat()
         c = self.db()
-        c.execute("update tasks set task_started_at=?,previous_node_started_at=? where id=?",
-                  (task_start, previous_start, "t_bbbb333344"))
+        c.execute("update tasks set task_started_at=?,next_prompt_at=? where id=?",
+                  (task_start, due, "t_bbbb333344"))
         c.commit()
-        frame = self.board(150)
+        with patch.object(self.handoff.time, "time", return_value=base):
+            frame = self.board(150)
         header, row = frame.splitlines()[2], [line for line in frame.splitlines()
                                               if "t_bbbb333344" in line][0]
         self.assertIn("START", header)
-        self.assertIn("PREV", header)
+        self.assertIn("REMIND", header)
         self.assertIn(self.handoff._display_time(task_start), row)
-        self.assertIn(self.handoff._display_time(previous_start), row)
+        self.assertIn("00:01:05", row)
+        with patch.object(self.handoff.time, "time", return_value=base + 30):
+            later = self.board(150)
+        self.assertIn("00:00:35", [line for line in later.splitlines()
+                                  if "t_bbbb333344" in line][0])
 
-    def test_board_falls_back_to_task_start_when_previous_node_is_missing(self):
-        task_start = "2026-09-16T08:09:00+00:00"
+    def test_reminder_column_handles_due_missing_and_closed_tasks(self):
         c = self.db()
-        c.execute("update tasks set task_started_at=?,previous_node_started_at=null,state_since=? where id=?",
-                  (task_start, task_start, "t_aaaa111122"))
+        c.execute("update tasks set next_prompt_at=null where id='t_aaaa111122'")
+        c.execute("update tasks set next_prompt_at=? where id='t_bbbb333344'",
+                  ((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),))
+        c.execute("update tasks set next_prompt_at=? where id='t_cccc555566'",
+                  ((datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),))
         c.commit()
-
-        item = next(item for item in self.handoff.board_items() if item["id"] == "t_aaaa111122")
-        self.assertEqual(item["previous_node_start"], self.handoff._display_time(task_start))
-        self.assertEqual(item["previous_node_start"], item["task_start"])
-
         frame = self.board(150)
-        row = [line for line in frame.splitlines() if "t_aaaa111122" in line][0]
-        self.assertEqual(row.count(self.handoff._display_time(task_start)), 2,
-                         "START and the PREV fallback should show the same initial node time")
+        rows = {task_id: next(line for line in frame.splitlines() if task_id in line)
+                for task_id in ("t_aaaa111122", "t_bbbb333344", "t_cccc555566")}
+        self.assertIn("due", rows["t_aaaa111122"])
+        self.assertIn("due", rows["t_bbbb333344"])
+        self.assertNotIn("01:00:00", rows["t_cccc555566"])
+        # A closed/non-remindable row leaves REMIND blank instead of showing a countdown.
+        self.assertNotIn("due", rows["t_cccc555566"])
+        self.assertNotIn("00:00:00", rows["t_cccc555566"])
 
     def test_cjk_measures_as_two_columns(self):
         dw, fit = self.handoff._dw, self.handoff._fit

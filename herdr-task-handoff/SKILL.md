@@ -1,9 +1,16 @@
 ---
 name: herdr-task-handoff
-description: "Use the local Herdr task handoff service for one explicit A-to-B task, including delivery, completion, reminders, and the terminal board."
+description: "Use the local Herdr task handoff service for explicit A→B→A tasks only: source delegates, target returns a result, and source reviews/claims it. Includes delivery, completion, reminders, and the terminal board."
 ---
 
 # Herdr Task Handoff
+
+Use this skill only for **A→B→A** handoffs: Source delegates, Target works and
+returns a result via `handoff done`, and Source reviews/claims it via `handoff claim`.
+
+Do **not** use for one-way fire-and-forget tasks where the Target works
+independently and the Source does not need to review the result. In that case,
+use `herdr agent prompt <target> "..."` directly, or do the work yourself.
 
 Use the `handoff` command after installation. If it is not available, run the
 installation script in this package and try again.
@@ -113,7 +120,7 @@ is), and a per-agent status for both ends straight from Herdr (`working`, `idle`
 `done`), each painted in its tool's own colour. The end that owes the next step is lit and the other is dimmed, which is how the
 board says whose move it is: a bright band travels along the name of the end that owes the
 next step, and the other name is dimmed.
-`START` (task start), `PREV` (previous node start; the first node falls back to `START`), state start time,
+`START` (task start) and `REMIND` (countdown to the next reminder for remindable actions; `due` when overdue and blank otherwise),
 state duration, next retry, retry count, and errors. Active tasks appear first; each group is ordered by
 the newest current node start time.
 The task rows have a muted right-edge scrollbar when rendered.
@@ -163,13 +170,17 @@ into a command. Earlier only `result_ready` was prettified to "result ready", wh
 one that differed the hardest to match against anything.
 
 Protocol reminders default to 30 seconds. Execution and review backoff default to 2, 4,
-8 minutes and cap at 8 hours. If an expected Agent is `working`, the daemon first uses
+8, 16, 32, and 60 minutes and cap at 1 hour. If an expected Agent is `working`, the daemon first uses
 `herdr agent wait <agent> --until idle`; that wait time is outside the backoff timer.
 
 The daemon skips a reminder when the target pane is focused or its current Herdr detection
 snapshot contains an interruption marker. These skips do not consume retries; reminders resume
 after the pane is no longer focused and the marker is gone. When Jev is configured it also
-holds a reminder back for work that is still visibly running.
+holds a reminder back for work that is still visibly running, chooses the next reminder delay
+from the 2, 4, 8, 16, 32, or 60 minute tier, or keeps the current deadline and tier, and
+updates the board reading with the same request when a reminder is due. A selected tier drives
+the later exponential backoff until 60 minutes. Reminder text asks the agent to report its state, waiting
+reason, awaited work, and expected completion or next change.
 
 A reminder names the exact command that is outstanding. Answer it with that command. None
 goes out while your pane is `blocked` -- an approval prompt is you being asked something, and
