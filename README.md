@@ -10,17 +10,19 @@ cd herdr-task-handoff
 handoff --help
 
 ./handoff daemon start
-./handoff send --source-pane w1:p1 \
+./handoff send --source-pane "$HERDR_PANE_ID" \
   --target-pane w1:p4 \
   --description "修复 footer 窄屏重叠" --prompt "检查并修复布局"
 ./handoff ui
 ```
 
+自己所在的 pane 就是 `$HERDR_PANE_ID`，Herdr 已经给到本 shell，直接当参数用；只有 Target 的 pane 需要从 `herdr pane list` 里整段抄（`w1:p4`，不能只写 `p4`）。`send`/`take`/`done`/`claim` 都会拒绝一个不是本命令所在 pane、或不是该任务这一端记录的 pane 的值，未结束的任务不变。
+
 B 按 Prompt 执行：
 
 ```sh
-./handoff take <task-id>
-./handoff done <task-id> --result-file result.md
+./handoff take <task-id> --pane "$HERDR_PANE_ID"
+./handoff done <task-id> --result-file result.md --pane "$HERDR_PANE_ID"
 ```
 
 长任务不必占着这一轮：后台跑，过程中用一行话报到。
@@ -28,8 +30,7 @@ B 按 Prompt 执行：
 A 领取并验收：
 
 ```sh
-./handoff claim <task-id>
-./handoff claim <task-id> --pane <your-pane>
+./handoff claim <task-id> --pane "$HERDR_PANE_ID"
 ```
 
 删除任务及其已保存结果：

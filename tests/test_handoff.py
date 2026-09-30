@@ -137,6 +137,12 @@ class HandoffTestBase(unittest.TestCase):
                                for k in ("HANDOFF_SWEEP_SECONDS", "HANDOFF_AGENT_WAIT_SLICE_MS")}
         os.environ["HANDOFF_SWEEP_SECONDS"] = "0.1"
         os.environ["HANDOFF_AGENT_WAIT_SLICE_MS"] = "100"
+        # The pane the test process runs in is not the pane a fixture names. Started from
+        # inside a Herdr pane, that variable is set, and every command that compares --pane
+        # with the caller's own would be refused for a reason the test never asked for. A test
+        # that wants the comparison sets it for itself.
+        self._saved_pane = os.environ.get("HERDR_PANE_ID")
+        os.environ.pop("HERDR_PANE_ID", None)
         self.isolate_herdr()
         sys.path.insert(0, str(ROOT))
         sys.modules.pop("handoff", None)
@@ -157,7 +163,8 @@ class HandoffTestBase(unittest.TestCase):
         else: os.environ["HERDR_BIN_PATH"] = self._saved_herdr
         os.environ.pop("FAKE_HERDR_LOG", None)
         os.environ.pop("HANDOFF_STATE_DIR", None)
-        os.environ.pop("HERDR_PANE_ID", None)
+        if self._saved_pane is None: os.environ.pop("HERDR_PANE_ID", None)
+        else: os.environ["HERDR_PANE_ID"] = self._saved_pane
         self.tmp.cleanup()
 
 
@@ -239,6 +246,61 @@ class HandoffCliTests(HandoffTestBase):
                          "an unresolvable Source pane must not replace the recorded one")
         self.assertEqual(row["state"], "finished",
                          "the guard must not block the protocol itself")
+
+    def test_a_live_pane_that_is_not_this_tasks_end_is_refused(self):
+        """A pane Herdr resolves, but that is not this task's end, must not repoint the record.
+
+        The unresolvable-pane repair does not cover this one: the value is live, so it used to
+        be written in. The daemon then addressed that pane for every later reminder while the
+        row no longer named the agent doing the work.
+        """
+        result = self.run_cli("take", "t_test", "--pane", "wA:pSOMEWHERE-ELSE")
+        self.assertNotEqual(result.returncode, 0, "a pane that is not this task's end")
+        self.assertIn("wA:pTEST-DST", result.stderr, "the refusal names the recorded pane")
+        row = self.db().execute("select * from tasks where id='t_test'").fetchone()
+        self.assertEqual(row["state"], "published", "the command must not have run")
+        self.assertEqual(row["target_pane"], "wA:pTEST-DST")
+
+    def test_a_command_must_run_in_the_pane_it_names(self):
+        """--pane is the caller's own pane, not a value copied out of the task text.
+
+        HERDR_PANE_ID is the pane Herdr handed the process. A command whose --pane differs is
+        running somewhere other than the pane it claims to speak for.
+        """
+        os.environ["HERDR_PANE_ID"] = "wA:pELSEWHERE"
+        try:
+            for command in (("take", "t_test", "--pane", "wA:pTEST-DST"),
+                            ("claim", "t_test", "--pane", "wA:pTEST-SRC")):
+                result = self.run_cli(*command)
+                self.assertNotEqual(result.returncode, 0, command)
+                self.assertIn("is not the pane this command runs in", result.stderr)
+            state = self.db().execute("select state from tasks where id='t_test'").fetchone()[0]
+            self.assertEqual(state, "published", "nothing may move while the pane is wrong")
+        finally:
+            os.environ.pop("HERDR_PANE_ID", None)
+
+    def test_a_command_from_the_pane_it_names_is_accepted(self):
+        os.environ["HERDR_PANE_ID"] = "wA:pTEST-DST"
+        try:
+            result = self.run_cli("take", "t_test", "--pane", "wA:pTEST-DST")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        finally:
+            os.environ.pop("HERDR_PANE_ID", None)
+        state = self.db().execute("select state from tasks where id='t_test'").fetchone()[0]
+        self.assertEqual(state, "active")
+
+    def test_send_refuses_a_source_pane_that_is_not_this_pane(self):
+        os.environ["HERDR_PANE_ID"] = "wA:pELSEWHERE"
+        try:
+            result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
+                                  "--target-pane", "wA:pTEST-FRESH",
+                                  "--description", "d", "--prompt", "p")
+            self.assertNotEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--source-pane", result.stderr)
+        finally:
+            os.environ.pop("HERDR_PANE_ID", None)
+        made = self.db().execute("select count(*) from tasks where target_pane='wA:pTEST-FRESH'").fetchone()[0]
+        self.assertEqual(made, 0, "a refused send must not record a task")
 
     def test_empty_description_rejected_by_parser(self):
         result = self.run_cli("send", "--source-pane", "wA:pTEST-SRC",
@@ -1876,9 +1938,9 @@ class BoardRenderTests(HandoffTestBase):
         expected = (
             "[HANDOFF TASK]\nTask ID: t_aaaa111122\nDescription: 中文描述测试\n"
             "Source: wA:p2V\nTarget: wA:p2W\n\n"
-            "Before any work, run:\npython3 %s take t_aaaa111122 --pane <your-pane>\n\n"
+            "Before any work, run:\npython3 %s take t_aaaa111122 --pane \"$HERDR_PANE_ID\"\n\n"
             "Task:\nprompt\n\n"
-            "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --pane <your-pane>\n"
+            "On completion run:\npython3 %s done t_aaaa111122 --result-file <path> --pane \"$HERDR_PANE_ID\"\n"
             'Only if refusing run:\npython3 %s reject t_aaaa111122 --reason "<reason>"'
             % (cli, cli, cli))
         self.assertEqual(self.handoff.task_text(row), expected)
@@ -1926,7 +1988,9 @@ class BoardRenderTests(HandoffTestBase):
         c = self.db()
         c.execute("update tasks set state='finished' where id='t_cccc555566'")
         c.commit()
-        result = self.run_cli("claim", "t_cccc555566", "--pane", "wA:pTEST-SRC")
+        # A retry is still a protocol command, so it comes from the row's own Source pane.
+        os.environ["HERDR_PANE_ID"] = "wA:p2W"
+        result = self.run_cli("claim", "t_cccc555566", "--pane", "wA:p2W")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_delete_tasks_removes_the_row_and_its_result_file(self):
@@ -1967,7 +2031,7 @@ class BoardRenderTests(HandoffTestBase):
         against the actual parser is what catches that class of bug.
         """
         import shlex
-        filled = {"<your-agent>": "a", "<your-tab>": "t", "<your-pane>": "p",
+        filled = {"<your-agent>": "a", "<your-tab>": "t", '"$HERDR_PANE_ID"': "wA:p1",
                   "<path>": "/tmp/result.md", '"<your answer>"': "yes"}
         parser = self.handoff.build_parser()
         for action in ("take", "done", "claim", "accept"):

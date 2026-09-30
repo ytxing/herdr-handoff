@@ -17,33 +17,51 @@ installation script in this package and try again.
 One Target holds at most one unfinished task at a time. Different Targets are independent,
 so concurrent handoffs are fine as long as they are not aimed at the same pane.
 
-## Confirm the Herdr pane first
+## Your pane, and the Target's pane
 
-Use the exact `pane_id` returned by Herdr. Do not shorten it or type only the pane suffix.
-Before sending or updating a task, confirm the pane with:
+Every command that names your own end must use the pane you are in. Herdr hands that pane to
+this shell, so it needs no lookup and no retyping:
 
 ```sh
-herdr pane current --current
+printf '%s\n' "$HERDR_PANE_ID"
+```
+
+The commands take it directly, as `"$HERDR_PANE_ID"`:
+
+```sh
+./handoff send  --source-pane "$HERDR_PANE_ID" --target-pane <target-pane> ...
+./handoff take  <task-id> --pane "$HERDR_PANE_ID"
+./handoff done  <task-id> --result-file <path> --pane "$HERDR_PANE_ID"
+./handoff claim <task-id> --pane "$HERDR_PANE_ID"
+```
+
+`take`, `done` and `claim` refuse a `--pane` that is not the pane the command runs in, and a
+`--pane` that is not the pane this task's end is recorded as.
+
+The Target's pane is the one value that has to be read from Herdr, and copied whole --
+`wA:p28`, never `p28`:
+
+```sh
 herdr pane list --workspace <workspace-id>
 ```
 
-Copy the complete value, such as `wA:p28`, into `handoff --source-pane`,
-`--target-pane`, or `--pane`. A value such as `p28` is incomplete and will be shown as
-absent even when Herdr has a live pane named `wA:p28`.
+A shortened value is not a shorthand for the same pane: the service shows it as absent even
+when Herdr has a live pane named `wA:p28`.
 
 ## Sending
 
-The sender must explicitly provide both Pane IDs:
+The sender provides both Pane IDs, its own from `$HERDR_PANE_ID`:
 
 ```sh
 ./handoff send \
-  --source-pane <source-pane> \
+  --source-pane "$HERDR_PANE_ID" \
   --target-pane <target-pane> \
   --description "<short or multiline description>" \
   --prompt "<task instructions>"
 ```
 
-`description` is required. The service verifies that both Agents exist through Herdr.
+`description` is required. The service verifies through Herdr that both Agents exist, and
+that `--source-pane` is the pane the command runs in.
 After `send` returns a task ID, do not poll Target or run `herdr agent wait` in the Source
 turn. End the turn or continue unrelated work; the handoff daemon handles later reminders
 and result notification.
@@ -53,13 +71,13 @@ and result notification.
 When a task arrives, execute `take` before doing work:
 
 ```sh
-./handoff take <task-id> --pane <your-pane>
+./handoff take <task-id> --pane "$HERDR_PANE_ID"
 ```
 
 When finished, write a readable result file and run:
 
 ```sh
-./handoff done <task-id> --result-file <path> --pane <your-pane>
+./handoff done <task-id> --result-file <path> --pane "$HERDR_PANE_ID"
 ```
 
 For a task with a handoff ID, do not use `herdr agent prompt` to return the result to
@@ -80,13 +98,13 @@ thing -- the Target has taken the task and is working on it.
 When the result prompt arrives, run:
 
 ```sh
-./handoff claim <task-id> --pane <your-pane>
+./handoff claim <task-id> --pane "$HERDR_PANE_ID"
 ```
 
 Inspect the saved result, then mark the task finished:
 
 ```sh
-./handoff claim <task-id> --pane <your-pane>
+./handoff claim <task-id> --pane "$HERDR_PANE_ID"
 ```
 
 `claim` records the Source review and moves the task to `finished`. If changes are needed, send a new task.

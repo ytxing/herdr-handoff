@@ -435,6 +435,42 @@ def decide_reminder(row, agent, snapshot=_UNSET, answers=_UNSET):
             return None
     return reminder_text(row, row["action"])
 
+# Commands that carry --pane, and so can be checked against the pane they were run in.
+PANE_COMMANDS = ("take", "done", "done-implicit", "claim", "accept")
+
+def check_own_pane(pane, flag):
+    """The pane a command claims as its own end must be the pane the command runs in.
+
+    Herdr puts the pane a process is running in into HERDR_PANE_ID. When it is set, a value
+    that differs is a pane the caller is not in, whatever it names, and the command is refused
+    before anything is written. Unset means the caller is outside Herdr (a person at a shell,
+    a first-run install), and there is nothing to compare against.
+    """
+    mine = os.environ.get("HERDR_PANE_ID")
+    if mine and mine != pane:
+        raise SystemExit("%s %s is not the pane this command runs in (%s)" % (flag, pane, mine))
+
+def check_caller_pane(row, pane):
+    """Refuse a protocol command that names a pane other than this task's own end.
+
+    Two ways `--pane` arrives wrong. The caller names a pane it is not in -- a value copied out
+    of the task text, or one read from the client's focus instead of its own pane. Or the value
+    is a live pane that is simply not this task's end. Both used to be written into the record
+    by record_identity, after which the daemon addressed that pane for every later reminder
+    while the row no longer named the agent doing the work.
+
+    A value Herdr cannot resolve is left alone: that is the repair record_identity keeps for an
+    agent that could not name its own pane, where the recorded pane stays and the command
+    itself still goes through.
+    """
+    check_own_pane(pane, "--pane")
+    side = REMINDER_RECIPIENT.get(row["action"])
+    if side is None: return
+    recorded = row[side + "_pane"]
+    if recorded and pane != recorded and agent_get(pane) is not None:
+        raise SystemExit("--pane %s is not this task's %s pane (%s); the task is unchanged"
+                         % (pane, side, recorded))
+
 def record_identity(c, row, a):
     """Refresh one side's pane from whoever just ran a protocol command.
 
@@ -445,9 +481,12 @@ def record_identity(c, row, a):
     later lookup found no such pane. Keeping the recorded pane when the new one does not
     resolve costs nothing -- the row still points at a pane that existed, which beats one
     that never did. The command itself still goes through: this is a repair, not a gate.
+    What the caller may not do is repoint the task at a pane that is not this side's own, and
+    check_caller_pane refuses that before this runs.
     """
     if agent_get(a.pane) is None: return
-    side = "target" if row["action"] in ("take", "done") else "source"
+    side = REMINDER_RECIPIENT.get(row["action"])
+    if side is None: return
     c.execute(f"update tasks set {side}_pane=? where id=?", (a.pane, row["id"]))
     c.commit()
 
@@ -477,15 +516,15 @@ def task_text(row, resend=False):
     return (head + "\nTask ID: {id}\nDescription: {description}\n"
             "Source: {source_pane}\nTarget: {target_pane}\n"
             + repeat + "\n"
-            "Before any work, run:\npython3 {cli} take {id} --pane <your-pane>\n\n"
+            "Before any work, run:\npython3 {cli} take {id} --pane \"$HERDR_PANE_ID\"\n\n"
             "Task:\n{prompt}\n\n"
-            "On completion run:\npython3 {cli} done {id} --result-file <path> --pane <your-pane>\n"
+            "On completion run:\npython3 {cli} done {id} --result-file <path> --pane \"$HERDR_PANE_ID\"\n"
             'Only if refusing run:\npython3 {cli} reject {id} --reason "<reason>"'
             ).format(cli=CLI, id=row["id"], description=row["description"],
                      source_pane=row["source_pane"], target_pane=row["target_pane"],
                      prompt=row["prompt"])
 
-IDENTITY_ARGS = "--pane <your-pane>"
+IDENTITY_ARGS = '--pane "$HERDR_PANE_ID"'
 REMINDER_COMMAND = {
     "take":   "python3 {cli} take {id} " + IDENTITY_ARGS,
     "done":   "python3 {cli} done {id} --result-file <path> " + IDENTITY_ARGS,
@@ -580,6 +619,7 @@ def cmd_send(a):
                  " limit 1", (a.target_pane,)).fetchone():
         raise SystemExit("this target already has an unfinished task")
     # Explicit source and target are required; validate when Herdr is available.
+    check_own_pane(a.source_pane, "--source-pane")
     if agent_get(a.source_pane) is None: raise SystemExit("source pane is absent or herdr is unavailable")
     if agent_get(a.target_pane) is None: raise SystemExit("target pane is absent or herdr is unavailable")
     started_at = now()
@@ -613,7 +653,8 @@ def cmd_action(a):
     # a terminal state, so every live state behaves exactly as before.
     if a.cmd in RESURRECTING_COMMANDS and row["state"] in CLOSED_STATES:
         raise SystemExit("task %s is already %s; `%s` refused" % (a.id, row["state"], a.cmd))
-    if a.cmd in ("take", "done", "done-implicit", "claim", "accept"):
+    if a.cmd in PANE_COMMANDS:
+        check_caller_pane(row, a.pane)
         record_identity(c, row, a)
     if a.cmd=="take": transition(c,a.id,"active","done","take")
     elif a.cmd=="done":
@@ -621,7 +662,7 @@ def cmd_action(a):
         if not p.is_file() or not os.access(p,os.R_OK): raise SystemExit("result file is not readable")
         dest=ROOT/"results"/(a.id+".md"); dest.parent.mkdir(exist_ok=True); shutil.copyfile(p,dest)
         c.execute("update tasks set result_file=? where id=?",(str(dest),a.id)); c.commit(); transition(c,a.id,"result_ready","claim","done")
-        prompt(row["source_pane"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --pane <your-pane>")
+        prompt(row["source_pane"],f"[HANDOFF RESULT READY]\nTask ID: {a.id}\nDescription: {row['description']}\nResult file: {dest}\n\nInspect it, then finish the task with:\npython3 {CLI} claim {a.id} --pane \"$HERDR_PANE_ID\"")
     elif a.cmd in ("claim", "accept"): transition(c,a.id,"finished","none",a.cmd)
     elif a.cmd=="reject": transition(c,a.id,"rejected","none","reject",a.reason)
     elif a.cmd=="cancel": transition(c,a.id,"cancelled","none","cancel")

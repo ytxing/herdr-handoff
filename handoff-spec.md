@@ -119,13 +119,13 @@ Source: <source-agent> / <source-pane>
 Target: <target-agent> / <target-pane>
 
 开始任何实际工作前，必须执行：
-handoff take <task-id>
+handoff take <task-id> --pane "$HERDR_PANE_ID"
 
 任务内容：
 <prompt>
 
 完成后执行：
-handoff done <task-id> --result-file <path>
+handoff done <task-id> --result-file <path> --pane "$HERDR_PANE_ID"
 
 明确不执行时才执行：
 handoff reject <task-id> --reason "<reason>"
@@ -177,7 +177,7 @@ Description: <description>
 Result file: <result-file>
 
 B 已提交任务结果。请检查结果后执行：
-handoff claim <task-id> --pane <your-pane>
+handoff claim <task-id> --pane "$HERDR_PANE_ID"
 
 `claim` 完成 Source 的检查并结束任务；需要修改时重新发布一个任务。
 ```
